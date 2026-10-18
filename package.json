@@ -1,0 +1,29 @@
+{
+  "name": "lbs-treasure-hunt-pwa",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=24"
+  },
+  "scripts": {
+    "dev": "node --experimental-strip-types src/server.ts",
+    "db:restore": "node --experimental-strip-types src/restore-backup.ts",
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.7",
+    "express": "^5.1.0",
+    "nodemailer": "^7.0.3",
+    "validator": "^13.15.15"
+  },
+  "devDependencies": {
+    "@types/express": "^5.0.3",
+    "@types/node": "^24.0.10",
+    "@types/nodemailer": "^6.4.17",
+    "@types/validator": "^13.15.3",
+    "typescript": "^5.8.3",
+    "vitest": "^3.2.4"
+  }
+}

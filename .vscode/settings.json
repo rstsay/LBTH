@@ -1,0 +1,9 @@
+{
+    "chat.tools.terminal.autoApprove": {
+        "gh": true,
+        "/^node --version; npm --version; git status --short --untracked-files=normal; git --no-pager ls-files; Get-ChildItem -Force -Name \\| Where-Object \\{ \\$_ -ne '\\.env' \\}$/": {
+            "approve": true,
+            "matchCommandLine": true
+        }
+    }
+}
