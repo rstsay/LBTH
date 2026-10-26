@@ -3,7 +3,7 @@ import {
   COLLECTION_THRESHOLD_METERS,
   EARTH_RADIUS_METERS,
   distanceMeters,
-} from "../src/geo.ts";
+} from "../web/geo.js";
 
 describe("共用 Haversine 定位距離", () => {
   it("exports the fixed collection threshold and Earth radius", () => {

@@ -1,0 +1,26 @@
+{
+  "id": "/app",
+  "name": "LBS 虛擬尋寶",
+  "short_name": "LBS 尋寶",
+  "description": "選擇一場尋寶遊戲，循著線索展開探索。",
+  "lang": "zh-Hant",
+  "start_url": "/app",
+  "scope": "/app",
+  "display": "standalone",
+  "background_color": "#f7f5f0",
+  "theme_color": "#f7f5f0",
+  "icons": [
+    {
+      "src": "/app/icons/icon-192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "/app/icons/icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any"
+    }
+  ]
+}

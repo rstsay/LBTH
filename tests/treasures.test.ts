@@ -2,7 +2,7 @@ import { DatabaseSync } from "node:sqlite";
 import { createServer, type Server } from "node:http";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { createAuthApp, type MagicLinkSender } from "../src/auth.ts";
-import { COLLECTION_THRESHOLD_METERS } from "../src/geo.ts";
+import { COLLECTION_THRESHOLD_METERS } from "../web/geo.js";
 
 class TestMagicLinkSender implements MagicLinkSender {
   readonly tokens: string[] = [];

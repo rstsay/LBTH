@@ -80,6 +80,31 @@ describe("玩家 Email Magic Link 驗證", () => {
     });
   }
 
+  it("serves a landing page that documents the available API endpoints", async () => {
+    const response = await fetch(`${baseUrl}/`);
+    const body = await response.text();
+
+    expect(response.status).toBe(200);
+    expect(response.headers.get("content-type")).toContain("text/html");
+    expect(body).toContain("API 服務運作中");
+    expect(body).toContain('href="/app"');
+    expect(body).toContain('href="/leaderboard"');
+    expect(body).toContain('href="/games"');
+    expect(body).toContain("玩家與管理員網頁介面已就緒");
+  });
+
+  it("serves the frontend and exposes only the configured public Maps key", async () => {
+    const appResponse = await fetch(`${baseUrl}/app`);
+    const configResponse = await fetch(`${baseUrl}/app/config.js`);
+    const configBody = await configResponse.text();
+
+    expect(appResponse.status).toBe(200);
+    expect(await appResponse.text()).toContain("LBS 虛擬尋寶");
+    expect(configResponse.status).toBe(200);
+    expect(configResponse.headers.get("cache-control")).toBe("no-store");
+    expect(configBody).toContain('googleMapsApiKey: ""');
+  });
+
   it("rejects malformed email addresses without sending a link", async () => {
     const response = await requestMagicLink("not-an-email");
 

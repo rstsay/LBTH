@@ -1,3 +1,10 @@
+# Project guidance
+
+- Before implementing an ambiguous feature, change, or migration, use the `grill-me` skill to clarify requirements.
+- Do not begin implementation until the requirements have been confirmed with the user.
+- Follow all applicable skills when their workflow matches the task.
+- 程式碼註解、介面文案、文件及對話回應使用繁體中文。
+
 # LBS 虛擬尋寶 PWA 專案指引
 
 ## 規格優先順序
@@ -10,7 +17,6 @@
 - 前端、後端、管理員測試與測試案例使用相同距離公式、半徑及比較精度；距離以未捨入值與 20 公尺比較，捨入僅供顯示。
 - accuracy 大於 50 公尺時不得搜集，須提示玩家改善定位；accuracy 不得改變 20 公尺距離門檻。
 - Google Maps API Key 透過 `.env` 環境變數管理，不得硬編碼或提交至 Git；設定 referrer 限制、用量上限及費用警示。
-- 程式碼註解、介面文案、文件及對話回應使用繁體中文。
 
 ## 定位、搜集與權威資料
 - 玩家一律使用前景 Real GPS；玩家端不得提供 Real／Mock 切換。背景時停止定位及回報，不自動暫停遊戲。

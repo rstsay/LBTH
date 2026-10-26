@@ -6,6 +6,7 @@ import { createServer } from "node:http";
 import { SmtpMagicLinkSender } from "./email.ts";
 import { createAuthApp, initializeAuthSchema } from "./auth.ts";
 import { runDataRetentionCleanup } from "./retention.ts";
+import { pauseStalePlayerGameSessions } from "./games.ts";
 import {
   configureSqliteReliability,
   createDatabaseBackup,
@@ -68,10 +69,9 @@ const app = createAuthApp({
   database,
   mailer,
   publicAppUrl: requiredEnvironmentVariable("PUBLIC_APP_URL"),
+  googleMapsApiKey: process.env.GOOGLE_MAPS_API_KEY?.trim() ?? "",
   adminBootstrapEmail: requiredEnvironmentVariable("ADMIN_BOOTSTRAP_EMAIL"),
-  adminTotpEncryptionKey: requiredEnvironmentVariable(
-    "ADMIN_TOTP_ENCRYPTION_KEY",
-  ),
+  adminTotpEncryptionKey: process.env.ADMIN_TOTP_ENCRYPTION_KEY?.trim(),
   trustProxyHops: nonNegativeIntegerEnvironmentVariable(
     "TRUST_PROXY_HOPS",
     0,
@@ -116,6 +116,19 @@ const retentionCleanupTimer = setInterval(() => {
   }
 }, 60 * 1000);
 retentionCleanupTimer.unref();
+const playerGameSessionTimer = setInterval(() => {
+  try {
+    pauseStalePlayerGameSessions(database, Date.now());
+  } catch (error) {
+    console.error("玩家遊戲回合心跳清理失敗：", error);
+  }
+}, 15 * 1000);
+playerGameSessionTimer.unref();
+try {
+  pauseStalePlayerGameSessions(database, Date.now());
+} catch (error) {
+  console.error("啟動時檢查玩家遊戲回合失敗：", error);
+}
 try {
   runDataRetentionCleanup(database, Date.now());
 } catch (error) {
@@ -138,6 +151,7 @@ for (const signal of ["SIGINT", "SIGTERM"] as const) {
   process.on(signal, () => {
     clearInterval(backupTimer);
     clearInterval(retentionCleanupTimer);
+    clearInterval(playerGameSessionTimer);
     server.close(async (error) => {
       if (error) {
         console.error("HTTP server shutdown failed:", error);

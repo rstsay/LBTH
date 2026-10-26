@@ -6,20 +6,22 @@ import {
   type Response,
   Router,
 } from "express";
+import { COLLECTION_THRESHOLD_METERS, distanceMeters } from "../web/geo.js";
+import type { Coordinates } from "../web/geo.js";
 import {
-  COLLECTION_THRESHOLD_METERS,
-  distanceMeters,
-  type Coordinates,
-} from "./geo.ts";
+  collectTreasure,
+  MAXIMUM_GPS_ACCURACY_METERS,
+  type CollectionRepository,
+} from "./game-collection-service.ts";
 import {
+  GAME_EVENT_RETENTION_MS,
   archiveGameEvents,
   recordDataRetentionAudit,
 } from "./retention.ts";
 import { beginWriteTransaction } from "./database-reliability.ts";
 
-const MAXIMUM_GPS_ACCURACY_METERS = 50;
-
 const ARCHIVE_PERIOD_MS = 7 * 24 * 60 * 60 * 1000;
+export const PLAYER_GAME_HEARTBEAT_TIMEOUT_MS = 2 * 60 * 1000;
 
 interface GameRecord {
   id: string;
@@ -42,6 +44,8 @@ interface ParticipantRecord {
   player_id: string;
   status: "playing" | "paused" | "exited";
   progress_json: string;
+  device_token_hash: string | null;
+  last_heartbeat_at: number | null;
 }
 
 interface TreasureRecord {
@@ -996,6 +1000,11 @@ function findPlayerId(response: Response): string | undefined {
   return typeof playerId === "string" ? playerId : undefined;
 }
 
+function findPlayerDeviceTokenHash(response: Response): string | undefined {
+  const tokenHash = response.locals.playerDeviceTokenHash;
+  return typeof tokenHash === "string" ? tokenHash : undefined;
+}
+
 function respondNotFound(response: Response): void {
   response.status(404).json({ error: "找不到指定的遊戲。" });
 }
@@ -1029,6 +1038,8 @@ export function initializeGameSchema(database: DatabaseSync): void {
       player_id TEXT NOT NULL REFERENCES players(id) ON DELETE CASCADE,
       status TEXT NOT NULL CHECK(status IN ('playing', 'paused', 'exited')),
       progress_json TEXT NOT NULL DEFAULT '{}',
+      device_token_hash TEXT,
+      last_heartbeat_at INTEGER,
       created_at INTEGER NOT NULL,
       updated_at INTEGER NOT NULL,
       PRIMARY KEY (game_id, player_id)
@@ -1140,7 +1151,25 @@ export function initializeGameSchema(database: DatabaseSync): void {
     CREATE UNIQUE INDEX IF NOT EXISTS game_participants_one_playing_game_per_player_idx
       ON game_participants(player_id)
       WHERE status = 'playing';
+
   `);
+  const participantColumns = database
+    .prepare("PRAGMA table_info(game_participants)")
+    .all() as Array<{ name: string }>;
+  if (!participantColumns.some((column) => column.name === "device_token_hash")) {
+    database.exec("ALTER TABLE game_participants ADD COLUMN device_token_hash TEXT");
+  }
+  if (!participantColumns.some((column) => column.name === "last_heartbeat_at")) {
+    database.exec("ALTER TABLE game_participants ADD COLUMN last_heartbeat_at INTEGER");
+  }
+  database.exec(
+    `CREATE INDEX IF NOT EXISTS game_participants_heartbeat_idx
+     ON game_participants(status, last_heartbeat_at)`,
+  );
+  database.exec(
+    `UPDATE game_participants SET last_heartbeat_at = updated_at
+     WHERE status = 'playing' AND last_heartbeat_at IS NULL`,
+  );
   const resetColumns = database
     .prepare("PRAGMA table_info(progress_reset_requests)")
     .all() as Array<{ name: string }>;
@@ -1154,6 +1183,60 @@ export function initializeGameSchema(database: DatabaseSync): void {
   }
   if (!resetColumns.some((column) => column.name === "restored_at")) {
     database.exec("ALTER TABLE progress_reset_requests ADD COLUMN restored_at INTEGER");
+  }
+}
+
+export function pauseStalePlayerGameSessions(
+  database: DatabaseSync,
+  timestamp: number,
+): number {
+  const cutoff = timestamp - PLAYER_GAME_HEARTBEAT_TIMEOUT_MS;
+  const staleParticipants = database
+    .prepare(
+      `SELECT participant.game_id, participant.player_id
+       FROM game_participants participant
+       JOIN games game ON game.id = participant.game_id
+       WHERE participant.status = 'playing'
+         AND (
+           COALESCE(participant.last_heartbeat_at, participant.updated_at) <= ? OR
+           game.status != 'published' OR game.starts_at > ? OR game.ends_at <= ?
+         )`,
+    )
+    .all(cutoff, timestamp, timestamp) as Array<{ game_id: string; player_id: string }>;
+  if (staleParticipants.length === 0) return 0;
+
+  beginWriteTransaction(database);
+  try {
+    let pausedCount = 0;
+    for (const participant of staleParticipants) {
+      const result = database
+        .prepare(
+          `UPDATE game_participants SET status = 'paused', device_token_hash = NULL,
+             last_heartbeat_at = NULL, updated_at = ?
+           WHERE game_id = ? AND player_id = ? AND status = 'playing'
+             AND (
+               COALESCE(last_heartbeat_at, updated_at) <= ? OR
+               EXISTS (
+                 SELECT 1 FROM games game WHERE game.id = game_participants.game_id
+                   AND (game.status != 'published' OR game.starts_at > ? OR game.ends_at <= ?)
+               )
+             )`,
+        )
+        .run(timestamp, participant.game_id, participant.player_id, cutoff, timestamp, timestamp);
+      if (Number(result.changes) !== 1) continue;
+      pausedCount += 1;
+      database
+        .prepare(
+          `UPDATE location_samples SET expires_at = ?
+           WHERE game_id = ? AND player_id = ? AND expires_at IS NULL`,
+        )
+        .run(timestamp + 24 * 60 * 60 * 1000, participant.game_id, participant.player_id);
+    }
+    database.exec("COMMIT");
+    return pausedCount;
+  } catch (error) {
+    database.exec("ROLLBACK");
+    throw error;
   }
 }
 
@@ -1214,6 +1297,271 @@ export function createAdminGameRouter(options: GameRouterOptions): Router {
       accuracyAccepted,
       withinThreshold,
       collectible: accuracyAccepted && withinThreshold,
+    });
+  });
+
+  router.get("/players", (request, response) => {
+    const gameId = request.query.gameId;
+    const anonymousCode = request.query.anonymousCode;
+    if (
+      typeof gameId !== "string" ||
+      gameId.trim().length === 0 ||
+      typeof anonymousCode !== "string" ||
+      anonymousCode.trim().length < 3 ||
+      anonymousCode.trim().length > 40
+    ) {
+      response.status(400).json({ error: "請選擇遊戲並輸入至少 3 個字元的匿名代碼。" });
+      return;
+    }
+    const game = options.database
+      .prepare("SELECT id, name FROM games WHERE id = ?")
+      .get(gameId.trim()) as { id: string; name: string } | undefined;
+    if (!game) {
+      respondNotFound(response);
+      return;
+    }
+    const players = options.database
+      .prepare(
+        "SELECT p.id AS player_id, p.anonymous_code, gp.game_id, " +
+          "g.name AS game_name, " +
+          "(SELECT COUNT(*) FROM collected_treasures c " +
+          "JOIN treasures t ON t.id = c.treasure_id AND t.game_id = c.game_id " +
+          "WHERE c.game_id = gp.game_id AND c.player_id = gp.player_id " +
+          "AND t.enabled = 1) AS collected_count, " +
+          "(SELECT COUNT(*) FROM treasures t " +
+          "WHERE t.game_id = gp.game_id AND t.enabled = 1) AS target_treasure_count " +
+          "FROM game_participants gp " +
+          "JOIN players p ON p.id = gp.player_id " +
+          "JOIN games g ON g.id = gp.game_id " +
+          "WHERE gp.game_id = ? AND instr(upper(p.anonymous_code), upper(?)) > 0 " +
+          "ORDER BY p.anonymous_code LIMIT 100",
+      )
+      .all(game.id, anonymousCode.trim()) as Array<{
+      player_id: string;
+      anonymous_code: string;
+      game_id: string;
+      game_name: string;
+      collected_count: number;
+      target_treasure_count: number;
+    }>;
+    response.setHeader("Cache-Control", "no-store");
+    response.json({
+      players: players.map((player) => {
+        const collections = options.database
+          .prepare(
+            "SELECT t.title AS treasure_title, c.collected_at, c.distance_meters " +
+              "FROM collected_treasures c " +
+              "JOIN treasures t ON t.id = c.treasure_id AND t.game_id = c.game_id " +
+              "JOIN games g ON g.id = c.game_id " +
+              "WHERE c.game_id = ? AND c.player_id = ? " +
+              "AND COALESCE(g.ended_at, g.ends_at) + ? > ? " +
+              "ORDER BY c.collected_at DESC LIMIT 101",
+          )
+          .all(
+            player.game_id,
+            player.player_id,
+            GAME_EVENT_RETENTION_MS,
+            options.now(),
+          ) as Array<{
+          treasure_title: string;
+          collected_at: number;
+          distance_meters: number;
+        }>;
+        return {
+          playerId: player.player_id,
+          anonymousCode: player.anonymous_code,
+          gameId: player.game_id,
+          gameName: player.game_name,
+          collectedCount: player.collected_count,
+          targetTreasureCount: player.target_treasure_count,
+          completed:
+            player.target_treasure_count > 0 &&
+            player.collected_count === player.target_treasure_count,
+          collections: collections.slice(0, 100).map((collection) => ({
+            treasureTitle: collection.treasure_title,
+            collectedAt: new Date(collection.collected_at).toISOString(),
+            distanceMeters: Math.round(collection.distance_meters * 10) / 10,
+          })),
+          hasMoreCollections: collections.length > 100,
+        };
+      }),
+    });
+  });
+
+  router.get("/operations", (_request, response) => {
+    const games = options.database
+      .prepare(
+        `WITH enabled_treasures AS (
+           SELECT game_id, COUNT(*) AS target_count
+           FROM treasures WHERE enabled = 1 GROUP BY game_id
+         ),
+         player_progress AS (
+           SELECT gp.game_id, gp.player_id,
+                  COALESCE(et.target_count, 0) AS target_count,
+                  (SELECT COUNT(*) FROM collected_treasures c
+                   JOIN treasures t ON t.id = c.treasure_id AND t.game_id = c.game_id
+                   WHERE c.game_id = gp.game_id AND c.player_id = gp.player_id AND t.enabled = 1) AS collected_count
+           FROM game_participants gp
+           LEFT JOIN enabled_treasures et ON et.game_id = gp.game_id
+         ),
+         completed AS (
+           SELECT game_id, COUNT(*) AS completed_count
+           FROM player_progress
+           WHERE target_count > 0 AND collected_count >= target_count
+           GROUP BY game_id
+         ),
+         collection_totals AS (
+           SELECT game_id, COUNT(*) AS collection_count
+           FROM collected_treasures GROUP BY game_id
+         )
+         SELECT g.id, g.name, g.status,
+                (SELECT COUNT(*) FROM game_participants gp WHERE gp.game_id = g.id) AS participant_count,
+                COALESCE(ct.collection_count, 0) AS collection_count,
+                (SELECT COUNT(*) FROM player_progress pp WHERE pp.game_id = g.id AND pp.target_count > 0) AS eligible_count,
+                COALESCE(c.completed_count, 0) AS completed_count
+         FROM games g
+         LEFT JOIN collection_totals ct ON ct.game_id = g.id
+         LEFT JOIN completed c ON c.game_id = g.id
+         WHERE g.status != 'draft'
+         ORDER BY g.starts_at DESC, g.id` ,
+      )
+      .all() as Array<{
+      id: string;
+      name: string;
+      status: string;
+      participant_count: number;
+      collection_count: number;
+      eligible_count: number;
+      completed_count: number;
+    }>;
+    const leaderboard = options.database
+      .prepare(
+        `WITH collection_stats AS (
+           SELECT player_id, COUNT(*) AS total_collected, MAX(collected_at) AS achieved_at
+           FROM collected_treasures GROUP BY player_id
+         ),
+         per_game_progress AS (
+           SELECT gp.player_id, gp.game_id,
+                  (SELECT COUNT(*) FROM treasures t WHERE t.game_id = gp.game_id AND t.enabled = 1) AS target_count,
+                  (SELECT COUNT(*) FROM collected_treasures c
+                   JOIN treasures t ON t.id = c.treasure_id AND t.game_id = c.game_id
+                   WHERE c.game_id = gp.game_id AND c.player_id = gp.player_id AND t.enabled = 1) AS collected_count
+           FROM game_participants gp
+         ),
+         completed_games AS (
+           SELECT player_id, COUNT(*) AS completed_count FROM per_game_progress
+           WHERE target_count > 0 AND collected_count = target_count GROUP BY player_id
+         )
+         SELECT COALESCE(NULLIF(p.nickname, ''), p.anonymous_code) AS display_name,
+                COALESCE(cs.total_collected, 0) AS total_collected,
+                COALESCE(cg.completed_count, 0) AS completed_games,
+                COALESCE(cs.achieved_at, 0) AS achieved_at, p.id AS stable_id
+         FROM players p
+         LEFT JOIN collection_stats cs ON cs.player_id = p.id
+         LEFT JOIN completed_games cg ON cg.player_id = p.id
+         WHERE p.leaderboard_visible = 1 AND COALESCE(cs.total_collected, 0) > 0
+         ORDER BY total_collected DESC, completed_games DESC, achieved_at ASC, stable_id ASC LIMIT 3`,
+      )
+      .all() as Array<{
+      display_name: string;
+      total_collected: number;
+      completed_games: number;
+    }>;
+    response.setHeader("Cache-Control", "no-store");
+    response.json({
+      games: games.map((game) => ({
+        gameId: game.id,
+        gameName: game.name,
+        status: game.status,
+        participantCount: game.participant_count,
+        validCollectionCount: game.collection_count,
+        completionRate:
+          game.eligible_count === 0
+            ? 0
+            : Math.round((game.completed_count / game.eligible_count) * 100),
+      })),
+      leaderboard: leaderboard.map((player, index) => ({
+        rank: index + 1,
+        displayName: player.display_name,
+        totalCollected: player.total_collected,
+        completedGames: player.completed_games,
+      })),
+    });
+  });
+
+  router.get("/progress-resets", (request, response) => {
+    const statusFilter = request.query.status ?? "all";
+    if (
+      statusFilter !== "all" &&
+      statusFilter !== "awaiting_confirmation" &&
+      statusFilter !== "completed" &&
+      statusFilter !== "restored"
+    ) {
+      response.status(400).json({ error: "進度重置狀態篩選條件無效。" });
+      return;
+    }
+    const rows = options.database
+      .prepare(
+        "SELECT r.id, r.game_id, r.player_id, r.reason, r.requested_by, " +
+          "r.confirmed_by, r.status, r.created_at, r.completed_at, " +
+          "r.restored_by, r.restored_at, p.anonymous_code, g.name AS game_name, " +
+          "(SELECT COUNT(*) FROM collected_treasures c " +
+          "WHERE c.game_id = r.game_id AND c.player_id = r.player_id) AS current_collections " +
+          "FROM progress_reset_requests r " +
+          "JOIN players p ON p.id = r.player_id " +
+          "JOIN games g ON g.id = r.game_id " +
+          "WHERE (? = 'all' OR " +
+          "(? = 'awaiting_confirmation' AND r.status = 'awaiting_confirmation') OR " +
+          "(? = 'completed' AND r.status = 'completed' AND r.restored_at IS NULL) OR " +
+          "(? = 'restored' AND r.restored_at IS NOT NULL)) " +
+          "ORDER BY r.created_at DESC, r.id DESC",
+      )
+      .all(statusFilter, statusFilter, statusFilter, statusFilter) as Array<{
+      id: string;
+      game_id: string;
+      player_id: string;
+      reason: string;
+      requested_by: string;
+      confirmed_by: string | null;
+      status: string;
+      created_at: number;
+      completed_at: number | null;
+      restored_by: string | null;
+      restored_at: number | null;
+      anonymous_code: string;
+      game_name: string;
+      current_collections: number;
+    }>;
+    const actorId = options.getAdminActorId?.(request)?.trim();
+    response.setHeader("Cache-Control", "no-store");
+    response.json({
+      requests: rows.map((row) => ({
+        resetId: row.id,
+        gameId: row.game_id,
+        gameName: row.game_name,
+        playerId: row.player_id,
+        anonymousCode: row.anonymous_code,
+        reason: row.reason,
+        requestedBy: row.requested_by,
+        confirmedBy: row.confirmed_by,
+        status: row.restored_at === null ? row.status : "restored",
+        createdAt: row.created_at,
+        completedAt: row.completed_at,
+        restoredBy: row.restored_by,
+        restoredAt: row.restored_at,
+        canConfirm:
+          row.status === "awaiting_confirmation" &&
+          Boolean(actorId) &&
+          actorId !== row.requested_by,
+        canRestore:
+          row.status === "completed" &&
+          row.restored_at === null &&
+          row.current_collections === 0,
+        restoreBlockedByNewCollections:
+          row.status === "completed" &&
+          row.restored_at === null &&
+          row.current_collections > 0,
+      })),
     });
   });
 
@@ -1303,6 +1651,27 @@ export function createAdminGameRouter(options: GameRouterOptions): Router {
           detectedAt: row.detected_at,
           status: row.status,
           decision: row.decision,
+          reviews: options.database
+            .prepare(
+              `SELECT actor_id, decision, notes, created_at
+               FROM anomaly_reviews WHERE anomaly_id = ?
+               ORDER BY created_at, id`,
+            )
+            .all(row.id)
+            .map((review) => {
+              const item = review as {
+                actor_id: string;
+                decision: string;
+                notes: string;
+                created_at: number;
+              };
+              return {
+                actorId: item.actor_id,
+                decision: item.decision,
+                notes: item.notes,
+                createdAt: item.created_at,
+              };
+            }),
         };
       }),
     });
@@ -1778,7 +2147,34 @@ export function createAdminGameRouter(options: GameRouterOptions): Router {
       .map(parseGameRecord);
     response.json({
       games: games.map((game) =>
-        serializeGame(game, options.now(), countEnabledTreasures(options.database, game.id)),
+        {
+          const now = options.now();
+          const serialized = serializeGame(
+            game,
+            now,
+            countEnabledTreasures(options.database, game.id),
+          );
+          const archiveStartedAt = game.ended_at ?? game.ends_at;
+          const hasArchive = game.status !== "draft";
+          return {
+            ...serialized,
+            archiveStartedAt: hasArchive
+              ? new Date(archiveStartedAt).toISOString()
+              : null,
+            archiveExpiresAt: hasArchive
+              ? new Date(archiveStartedAt + ARCHIVE_PERIOD_MS).toISOString()
+              : null,
+            archiveRestoredAt:
+              game.archive_restored_at === null
+                ? null
+                : new Date(game.archive_restored_at).toISOString(),
+            canRestore: serialized.status === "archived",
+            canPermanentlyDelete:
+              game.status === "draft" ||
+              ((game.status === "ended" || now >= game.ends_at) &&
+                now >= archiveStartedAt + ARCHIVE_PERIOD_MS),
+          };
+        },
       ),
     });
   });
@@ -2502,6 +2898,74 @@ export function createAdminGameRouter(options: GameRouterOptions): Router {
 export function createPlayerGameRouter(options: GameRouterOptions): Router {
   const router = Router();
   const createId = options.createId ?? randomUUID;
+  const collectionRepository: CollectionRepository = {
+    findGame: (gameId) => {
+      const game = findGame(options.database, gameId);
+      return game
+        ? { status: game.status, startsAt: game.starts_at, endsAt: game.ends_at }
+        : undefined;
+    },
+    findParticipant: (gameId, playerId) => {
+      const participant = options.database
+        .prepare(
+          `SELECT status FROM game_participants
+           WHERE game_id = ? AND player_id = ?`,
+        )
+        .get(gameId, playerId) as { status: string } | undefined;
+      return participant ? { status: participant.status } : undefined;
+    },
+    findTreasure: (gameId, treasureId) => {
+      const treasure = findTreasure(options.database, gameId, treasureId);
+      return treasure
+        ? {
+            enabled: treasure.enabled === 1,
+            latitude: treasure.latitude,
+            longitude: treasure.longitude,
+          }
+        : undefined;
+    },
+    findCollection: (gameId, playerId, treasureId) => {
+      const collection = options.database
+        .prepare(
+          `SELECT distance_meters FROM collected_treasures
+           WHERE game_id = ? AND player_id = ? AND treasure_id = ?`,
+        )
+        .get(gameId, playerId, treasureId) as
+        | { distance_meters: number }
+        | undefined;
+      return collection ? { distanceMeters: collection.distance_meters } : undefined;
+    },
+    beginWriteTransaction: () => beginWriteTransaction(options.database),
+    commit: () => options.database.exec("COMMIT"),
+    rollback: () => options.database.exec("ROLLBACK"),
+    recordAttempt: (gameId, playerId, treasureId, timestamp) =>
+      recordCollectionAttempt(
+        options.database,
+        createId,
+        gameId,
+        playerId,
+        treasureId,
+        timestamp,
+      ),
+    insertCollection: (collection) => {
+      options.database
+        .prepare(
+          `INSERT INTO collected_treasures (
+            game_id, player_id, treasure_id, collected_at, distance_meters, accuracy
+          ) VALUES (?, ?, ?, ?, ?, ?)`,
+        )
+        .run(
+          collection.gameId,
+          collection.playerId,
+          collection.treasureId,
+          collection.timestamp,
+          collection.distanceMeters,
+          collection.accuracy,
+        );
+    },
+    refreshProgress: (gameId, playerId, timestamp) =>
+      refreshAuthoritativeProgress(options.database, gameId, playerId, timestamp),
+  };
 
   router.get("/", (_request: Request, response: Response) => {
     const games = options.database
@@ -2666,8 +3130,13 @@ export function createPlayerGameRouter(options: GameRouterOptions): Router {
 
   router.post("/:gameId/join", (request: Request, response: Response) => {
     const playerId = findPlayerId(response);
+    const deviceTokenHash = findPlayerDeviceTokenHash(response);
     if (!playerId) {
       response.status(401).json({ error: "請先登入。" });
+      return;
+    }
+    if (!deviceTokenHash) {
+      response.status(401).json({ error: "此裝置尚未完成信任，請重新登入。" });
       return;
     }
     const gameId = routeGameId(request);
@@ -2690,6 +3159,7 @@ export function createPlayerGameRouter(options: GameRouterOptions): Router {
       return;
     }
 
+    pauseStalePlayerGameSessions(options.database, timestamp);
     beginWriteTransaction(options.database);
     try {
       const activeGame = options.database
@@ -2708,6 +3178,17 @@ export function createPlayerGameRouter(options: GameRouterOptions): Router {
         .prepare("SELECT * FROM game_participants WHERE game_id = ? AND player_id = ?")
         .get(game.id, playerId) as ParticipantRecord | undefined;
       if (participant?.status === "playing") {
+        if (participant.device_token_hash && participant.device_token_hash !== deviceTokenHash) {
+          options.database.exec("ROLLBACK");
+          respondConflict(response, "此遊戲回合已綁定另一裝置，請先暫停或等待心跳逾時。");
+          return;
+        }
+        options.database
+          .prepare(
+            `UPDATE game_participants SET device_token_hash = ?, last_heartbeat_at = ?
+             WHERE game_id = ? AND player_id = ? AND status = 'playing'`,
+          )
+          .run(deviceTokenHash, timestamp, game.id, playerId);
         options.database.exec("COMMIT");
         response.json({
           gameId: game.id,
@@ -2719,18 +3200,20 @@ export function createPlayerGameRouter(options: GameRouterOptions): Router {
       if (participant) {
         options.database
           .prepare(
-            `UPDATE game_participants SET status = 'playing', updated_at = ?
+            `UPDATE game_participants SET status = 'playing', updated_at = ?,
+               device_token_hash = ?, last_heartbeat_at = ?
                WHERE game_id = ? AND player_id = ? AND status IN ('paused', 'exited')`,
           )
-          .run(timestamp, game.id, playerId);
+          .run(timestamp, deviceTokenHash, timestamp, game.id, playerId);
       } else {
         options.database
           .prepare(
             `INSERT INTO game_participants (
-              game_id, player_id, status, progress_json, created_at, updated_at
-            ) VALUES (?, ?, 'playing', '{}', ?, ?)`,
+              game_id, player_id, status, progress_json, device_token_hash,
+              last_heartbeat_at, created_at, updated_at
+            ) VALUES (?, ?, 'playing', '{}', ?, ?, ?, ?)`,
           )
-          .run(game.id, playerId, timestamp, timestamp);
+          .run(game.id, playerId, deviceTokenHash, timestamp, timestamp, timestamp);
       }
       const resumed = options.database
         .prepare("SELECT * FROM game_participants WHERE game_id = ? AND player_id = ?")
@@ -2750,8 +3233,42 @@ export function createPlayerGameRouter(options: GameRouterOptions): Router {
     }
   });
 
+  router.post("/:gameId/heartbeat", (request: Request, response: Response) => {
+    const playerId = findPlayerId(response);
+    const deviceTokenHash = findPlayerDeviceTokenHash(response);
+    const gameId = routeGameId(request);
+    if (!playerId || !deviceTokenHash) {
+      response.status(401).json({ error: "請先以信任裝置登入。" });
+      return;
+    }
+    if (!gameId) {
+      respondNotFound(response);
+      return;
+    }
+    const timestamp = options.now();
+    pauseStalePlayerGameSessions(options.database, timestamp);
+    const updated = options.database
+      .prepare(
+        `UPDATE game_participants SET last_heartbeat_at = ?,
+           device_token_hash = COALESCE(device_token_hash, ?)
+         WHERE game_id = ? AND player_id = ? AND status = 'playing'
+           AND (device_token_hash IS NULL OR device_token_hash = ?)`,
+      )
+      .run(timestamp, deviceTokenHash, gameId, playerId, deviceTokenHash);
+    if (Number(updated.changes) !== 1) {
+      response.status(409).json({
+        code: "PLAYER_GAME_SESSION_PAUSED",
+        error: "此遊戲回合已暫停或由其他裝置接手，請重新選擇遊戲。",
+      });
+      return;
+    }
+    response.setHeader("Cache-Control", "no-store");
+    response.json({ gameId, status: "playing", heartbeatAt: new Date(timestamp).toISOString() });
+  });
+
   router.post("/:gameId/pause", (request: Request, response: Response) => {
     const playerId = findPlayerId(response);
+    const deviceTokenHash = findPlayerDeviceTokenHash(response);
     if (!playerId) {
       response.status(401).json({ error: "請先登入。" });
       return;
@@ -2763,10 +3280,12 @@ export function createPlayerGameRouter(options: GameRouterOptions): Router {
     }
     const result = options.database
       .prepare(
-        `UPDATE game_participants SET status = 'paused', updated_at = ?
-         WHERE game_id = ? AND player_id = ? AND status = 'playing'`,
+        `UPDATE game_participants SET status = 'paused', device_token_hash = NULL,
+           last_heartbeat_at = NULL, updated_at = ?
+         WHERE game_id = ? AND player_id = ? AND status = 'playing'
+           AND (device_token_hash IS NULL OR device_token_hash = ?)`,
       )
-      .run(options.now(), gameId, playerId);
+      .run(options.now(), gameId, playerId, deviceTokenHash ?? "");
     if (Number(result.changes) !== 1) {
       respondConflict(response, "目前沒有正在進行的這場遊戲。");
       return;
@@ -2806,140 +3325,57 @@ export function createPlayerGameRouter(options: GameRouterOptions): Router {
         response.status(400).json({ error: "定位資料無效，玩家只能使用 Real GPS。" });
         return;
       }
-      const participant = options.database
-        .prepare(
-          `SELECT * FROM game_participants
-           WHERE game_id = ? AND player_id = ?`,
-        )
-        .get(game.id, playerId) as ParticipantRecord | undefined;
-      if (!participant) {
-        respondConflict(response, "請先加入這場遊戲。");
-        return;
-      }
-
-      if (
-        participant.status === "playing" &&
-        isGameCurrentlyPlayable(game, timestamp)
-      ) {
-        beginWriteTransaction(options.database);
-        try {
-          recordCollectionAttempt(
-            options.database,
-            createId,
-            game.id,
-            playerId,
-            treasure.id,
-            timestamp,
-          );
-          options.database.exec("COMMIT");
-        } catch (error) {
-          options.database.exec("ROLLBACK");
-          throw error;
-        }
-      }
-
-      beginWriteTransaction(options.database);
-      try {
-        const currentGame = findGame(options.database, game.id);
-        const currentParticipant = options.database
-          .prepare(
-            `SELECT * FROM game_participants
-             WHERE game_id = ? AND player_id = ?`,
-          )
-          .get(game.id, playerId) as ParticipantRecord | undefined;
-        const currentTreasure = findTreasure(options.database, game.id, treasure.id);
-        if (!currentGame || !currentParticipant || !currentTreasure) {
-          options.database.exec("ROLLBACK");
+      const result = collectTreasure(collectionRepository, {
+        gameId: game.id,
+        playerId,
+        treasureId: treasure.id,
+        timestamp,
+        position,
+        initialGame: {
+          status: game.status,
+          startsAt: game.starts_at,
+          endsAt: game.ends_at,
+        },
+      });
+      switch (result.kind) {
+        case "participant_missing":
+          respondConflict(response, "請先加入這場遊戲。");
+          return;
+        case "state_changed":
           respondConflict(response, "遊戲參與或寶藏資料已變更，請重新整理後再試。");
           return;
-        }
-
-        const existingCollection = options.database
-          .prepare(
-            `SELECT distance_meters FROM collected_treasures
-             WHERE game_id = ? AND player_id = ? AND treasure_id = ?`,
-          )
-          .get(game.id, playerId, treasure.id) as
-          | { distance_meters: number }
-          | undefined;
-        if (existingCollection) {
-          const summary = refreshAuthoritativeProgress(
-            options.database,
-            game.id,
-            playerId,
-            timestamp,
-          );
-          options.database.exec("COMMIT");
-          response.json({
-            collected: true,
-            alreadyCollected: true,
-            treasureId: treasure.id,
-            distanceMeters: existingCollection.distance_meters,
-            ...summary,
-          });
-          return;
-        }
-        if (
-          currentParticipant.status !== "playing" ||
-          !isGameCurrentlyPlayable(currentGame, timestamp)
-        ) {
-          options.database.exec("ROLLBACK");
+        case "game_not_playing":
           respondConflict(response, "遊戲目前未進行，不能搜集寶藏。");
           return;
-        }
-        if (currentTreasure.enabled !== 1) {
-          options.database.exec("ROLLBACK");
+        case "treasure_disabled":
           respondConflict(response, "此寶藏已停用，不能搜集。");
           return;
-        }
-        if (position.accuracy > MAXIMUM_GPS_ACCURACY_METERS) {
-          options.database.exec("ROLLBACK");
+        case "accuracy_too_low":
           response.status(422).json({
             error: "GPS_ACCURACY_TOO_LOW",
             message: "定位精度不足，請移至空曠處或稍後再試",
-            maximumAccuracyMeters: MAXIMUM_GPS_ACCURACY_METERS,
+            maximumAccuracyMeters: result.maximumAccuracyMeters,
           });
           return;
-        }
-        const distance = distanceMeters(position, {
-          latitude: currentTreasure.latitude,
-          longitude: currentTreasure.longitude,
-        });
-        if (distance > COLLECTION_THRESHOLD_METERS) {
-          options.database.exec("ROLLBACK");
+        case "distance_too_far":
           response.status(422).json({
             error: "DISTANCE_TOO_FAR",
             message: "距離寶藏太遠，請再靠近一些。",
-            distanceMeters: distance,
+            distanceMeters: result.distanceMeters,
             thresholdMeters: COLLECTION_THRESHOLD_METERS,
           });
           return;
-        }
-
-        options.database
-          .prepare(
-            `INSERT INTO collected_treasures (
-              game_id, player_id, treasure_id, collected_at, distance_meters, accuracy
-            ) VALUES (?, ?, ?, ?, ?, ?)`,
-          )
-          .run(game.id, playerId, treasure.id, timestamp, distance, position.accuracy);
-        const summary = refreshAuthoritativeProgress(
-          options.database,
-          game.id,
-          playerId,
-          timestamp,
-        );
-        options.database.exec("COMMIT");
-        response.json({
-          collected: true,
-          alreadyCollected: false,
-          treasureId: treasure.id,
-          distanceMeters: distance,
-          ...summary,
-        });
-      } catch (error) {
-        options.database.exec("ROLLBACK");
-        throw error;
+        case "collected":
+          response.json({
+            collected: true,
+            alreadyCollected: result.alreadyCollected,
+            treasureId: result.treasureId,
+            distanceMeters: result.distanceMeters,
+            progress: result.progress,
+            totalCollected: result.totalCollected,
+            totalCollectedSoFar: result.totalCollectedSoFar,
+          });
+          return;
       }
     },
   );
@@ -2957,10 +3393,12 @@ export function createPlayerGameRouter(options: GameRouterOptions): Router {
     }
     const result = options.database
       .prepare(
-        `UPDATE game_participants SET status = 'exited', updated_at = ?
-         WHERE game_id = ? AND player_id = ? AND status IN ('playing', 'paused')`,
+        `UPDATE game_participants SET status = 'exited', device_token_hash = NULL,
+           last_heartbeat_at = NULL, updated_at = ?
+         WHERE game_id = ? AND player_id = ? AND status IN ('playing', 'paused')
+           AND (status != 'playing' OR device_token_hash IS NULL OR device_token_hash = ?)`,
       )
-      .run(options.now(), gameId, playerId);
+      .run(options.now(), gameId, playerId, findPlayerDeviceTokenHash(response) ?? "");
     if (Number(result.changes) !== 1) {
       respondConflict(response, "目前沒有可退出的這場遊戲。");
       return;
@@ -3006,15 +3444,42 @@ export function createPlayerSessionMiddleware(database: DatabaseSync): RequestHa
     const tokenHash = createHash("sha256").update(token).digest("hex");
     const session = database
       .prepare(
-        `SELECT player_id FROM player_sessions
+        `SELECT player_id, device_token_hash FROM player_sessions
          WHERE token_hash = ? AND revoked_at IS NULL`,
       )
-      .get(tokenHash) as { player_id: string } | undefined;
+      .get(tokenHash) as { player_id: string; device_token_hash: string | null } | undefined;
     if (!session) {
       response.status(401).json({ error: "請先登入。" });
       return;
     }
+    let deviceTokenHash = session.device_token_hash ?? undefined;
+    if (!deviceTokenHash) {
+      const trustedCookie = cookieHeader
+        ?.split(";")
+        .map((part) => part.trim())
+        .find((part) => part.startsWith("player_trusted_device="));
+      const trustedToken = trustedCookie?.slice("player_trusted_device=".length);
+      if (trustedToken) {
+        const candidateHash = createHash("sha256").update(trustedToken).digest("hex");
+        const trusted = database
+          .prepare(
+            `SELECT 1 FROM player_trusted_devices
+             WHERE token_hash = ? AND player_id = ? AND revoked_at IS NULL`,
+          )
+          .get(candidateHash, session.player_id);
+        if (trusted) {
+          database
+            .prepare(
+              `UPDATE player_sessions SET device_token_hash = ?
+               WHERE token_hash = ? AND revoked_at IS NULL AND device_token_hash IS NULL`,
+            )
+            .run(candidateHash, tokenHash);
+          deviceTokenHash = candidateHash;
+        }
+      }
+    }
     response.locals.playerId = session.player_id;
+    if (deviceTokenHash) response.locals.playerDeviceTokenHash = deviceTokenHash;
     next();
   };
 }

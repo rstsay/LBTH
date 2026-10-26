@@ -214,6 +214,50 @@ describe("異常訊號與雙人審查", () => {
     ).toEqual({ expires_at: now + 24 * 60 * 60 * 1000 });
   });
 
+  it("finds game participants by anonymous code without returning their email", async () => {
+    const cookie = await createPlayer("lookup@example.com");
+    const { gameId } = await createGame(cookie);
+    const player = database
+      .prepare("SELECT id, anonymous_code FROM players WHERE email = ?")
+      .get("lookup@example.com") as { id: string; anonymous_code: string };
+
+    const response = await adminRequest(
+      "/admin/games/players?gameId=" +
+        encodeURIComponent(gameId) +
+        "&anonymousCode=" +
+        encodeURIComponent(player.anonymous_code),
+      "GET",
+    );
+    const result = await response.json();
+
+    expect(response.status).toBe(200);
+    expect(result.players).toHaveLength(1);
+    expect(result.players[0]).toMatchObject({
+      playerId: player.id,
+      anonymousCode: player.anonymous_code,
+      gameId,
+      collectedCount: 0,
+      targetTreasureCount: 1,
+      completed: false,
+    });
+    expect(result.players[0].gameName).toEqual(expect.any(String));
+    expect(JSON.stringify(result)).not.toContain("lookup@example.com");
+    expect(
+      database
+        .prepare(
+          "SELECT actor_id, target_type, target_id, result, summary_json " +
+            "FROM admin_audit_log WHERE action = 'GET /admin/games/players' " +
+            "ORDER BY created_at DESC LIMIT 1",
+        )
+        .get(),
+    ).toMatchObject({
+      actor_id: "admin-1",
+      target_type: "players",
+      target_id: gameId,
+      result: "success",
+    });
+  });
+
   it("does not signal GPS drift when accuracy-adjusted speed is below the threshold", async () => {
     const cookie = await createPlayer("drift@example.com");
     const { gameId } = await createGame(cookie);
@@ -307,7 +351,14 @@ describe("異常訊號與雙人審查", () => {
     expect(conflictingConfirmation.status).toBe(409);
     expect(secondReview.status).toBe(200);
     expect(updatedList.anomalies.find((item: { id: string }) => item.id === anomalyId))
-      .toMatchObject({ status: "reviewed", decision: "confirmed" });
+      .toMatchObject({
+        status: "reviewed",
+        decision: "confirmed",
+        reviews: [
+          { actorId: "admin-1", decision: "confirmed" },
+          { actorId: "admin-2", decision: "confirmed" },
+        ],
+      });
     expect(
       database
         .prepare(
@@ -339,6 +390,34 @@ describe("異常訊號與雙人審查", () => {
       "admin-1",
     );
     const reset = await resetResponse.json();
+    const pendingAsRequesterResponse = await adminRequest(
+      "/admin/games/progress-resets?status=awaiting_confirmation",
+      "GET",
+      undefined,
+      "admin-1",
+    );
+    const pendingAsRequester = await pendingAsRequesterResponse.json();
+    const pendingAsSecondAdminResponse = await adminRequest(
+      "/admin/games/progress-resets?status=awaiting_confirmation",
+      "GET",
+      undefined,
+      "admin-2",
+    );
+    const pendingAsSecondAdmin = await pendingAsSecondAdminResponse.json();
+    expect(
+      database
+        .prepare(
+          "SELECT actor_id, target_type, result, summary_json " +
+            "FROM admin_audit_log WHERE actor_id = 'admin-2' " +
+            "AND action = 'GET /admin/games/progress-resets' " +
+            "ORDER BY created_at DESC LIMIT 1",
+        )
+        .get(),
+    ).toMatchObject({
+      actor_id: "admin-2",
+      target_type: "progress-resets",
+      result: "success",
+    });
     const selfConfirm = await adminRequest(
       `/admin/games/progress-resets/${reset.resetId}/confirm`,
       "POST",
@@ -353,6 +432,22 @@ describe("異常訊號與雙人審查", () => {
     );
 
     expect(resetResponse.status).toBe(202);
+    expect(pendingAsRequester.requests[0]).toMatchObject({
+      resetId: reset.resetId,
+      playerId,
+      anonymousCode: expect.any(String),
+      gameId,
+      gameName: expect.any(String),
+      status: "awaiting_confirmation",
+      reason: "使用者確認需重置",
+      requestedBy: "admin-1",
+      confirmedBy: null,
+      restoredBy: null,
+      canConfirm: false,
+      canRestore: false,
+    });
+    expect(pendingAsSecondAdmin.requests[0].canConfirm).toBe(true);
+    expect(JSON.stringify(pendingAsRequester)).not.toContain("reset@example.com");
     expect(selfConfirm.status).toBe(409);
     expect(secondConfirm.status).toBe(200);
     expect(
@@ -385,6 +480,22 @@ describe("異常訊號與雙人審查", () => {
       completed: false,
     });
 
+    const completedListResponse = await adminRequest(
+      "/admin/games/progress-resets?status=completed",
+      "GET",
+      undefined,
+      "admin-2",
+    );
+    const completedList = await completedListResponse.json();
+    expect(completedList.requests[0]).toMatchObject({
+      resetId: reset.resetId,
+      status: "completed",
+      requestedBy: "admin-1",
+      confirmedBy: "admin-2",
+      canConfirm: false,
+      canRestore: true,
+    });
+
     const restoredResponse = await adminRequest(
       `/admin/games/progress-resets/${reset.resetId}/restore`,
       "POST",
@@ -398,6 +509,11 @@ describe("異常訊號與雙人審查", () => {
       {},
       "admin-4",
     );
+    const restoredListResponse = await adminRequest(
+      "/admin/games/progress-resets?status=restored",
+      "GET",
+    );
+    const restoredList = await restoredListResponse.json();
 
     expect(restoredResponse.status).toBe(200);
     expect(restored).toMatchObject({
@@ -411,6 +527,15 @@ describe("異常訊號與雙人審查", () => {
       totalCollectedSoFar: 1,
     });
     expect(duplicateRestore.status).toBe(409);
+    expect(restoredList.requests[0]).toMatchObject({
+      resetId: reset.resetId,
+      status: "restored",
+      requestedBy: "admin-1",
+      confirmedBy: "admin-2",
+      restoredBy: "admin-3",
+      canConfirm: false,
+      canRestore: false,
+    });
     expect(
       database.prepare("SELECT COUNT(*) AS count FROM collected_treasures").get(),
     ).toEqual({ count: 1 });
@@ -443,6 +568,18 @@ describe("異常訊號與雙人審查", () => {
       ).status,
     ).toBe(200);
     expect((await collect(gameId, treasureId, cookie)).status).toBe(200);
+    const afterNewCollectionListResponse = await adminRequest(
+      "/admin/games/progress-resets?status=completed",
+      "GET",
+      undefined,
+      "admin-3",
+    );
+    const afterNewCollectionList = await afterNewCollectionListResponse.json();
+    expect(afterNewCollectionList.requests[0]).toMatchObject({
+      resetId,
+      canRestore: false,
+      restoreBlockedByNewCollections: true,
+    });
 
     const restoreResponse = await adminRequest(
       `/admin/games/progress-resets/${resetId}/restore`,

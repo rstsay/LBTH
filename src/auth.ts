@@ -15,6 +15,7 @@ import express, {
   type Response,
 } from "express";
 import validator from "validator";
+import { fileURLToPath } from "node:url";
 import {
   configureSqliteReliability,
   beginWriteTransaction,
@@ -32,14 +33,18 @@ import {
   createAdminGameRouter,
   createPlayerGameRouter,
   createPlayerSessionMiddleware,
+  pauseStalePlayerGameSessions,
+  PLAYER_GAME_HEARTBEAT_TIMEOUT_MS,
   initializeGameSchema,
   type AdminAuthorizer,
 } from "./games.ts";
 
 const MAGIC_LINK_TTL_MS = 15 * 60 * 1000;
 const SESSION_COOKIE_NAME = "player_session";
+const TRUSTED_DEVICE_COOKIE_NAME = "player_trusted_device";
+const TRUSTED_DEVICE_COOKIE_MAX_AGE_SECONDS = 10 * 365 * 24 * 60 * 60;
 const ADMIN_SESSION_COOKIE_NAME = "admin_session";
-const ADMIN_CHALLENGE_TTL_MS = 5 * 60 * 1000;
+const ADMIN_TRUSTED_DEVICE_COOKIE_NAME = "admin_trusted_device";
 const ADMIN_SESSION_TTL_MS = 12 * 60 * 60 * 1000;
 const ADMIN_AUDIT_RETENTION_MS = 90 * 24 * 60 * 60 * 1000;
 const BASE32_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
@@ -52,6 +57,7 @@ export interface AuthAppOptions {
   database: DatabaseSync;
   mailer: MagicLinkSender;
   publicAppUrl: string;
+  googleMapsApiKey?: string;
   now?: () => number;
   createToken?: () => string;
   createId?: () => string;
@@ -116,9 +122,21 @@ export function initializeAuthSchema(database: DatabaseSync): void {
     CREATE TABLE IF NOT EXISTS player_sessions (
       token_hash TEXT PRIMARY KEY,
       player_id TEXT NOT NULL REFERENCES players(id),
+      device_token_hash TEXT,
       created_at INTEGER NOT NULL,
       revoked_at INTEGER
     );
+
+    CREATE TABLE IF NOT EXISTS player_trusted_devices (
+      token_hash TEXT PRIMARY KEY,
+      player_id TEXT NOT NULL REFERENCES players(id),
+      created_at INTEGER NOT NULL,
+      last_seen_at INTEGER NOT NULL,
+      revoked_at INTEGER
+    );
+
+    CREATE INDEX IF NOT EXISTS player_trusted_devices_player_idx
+      ON player_trusted_devices(player_id, revoked_at);
 
     CREATE TABLE IF NOT EXISTS administrators (
       id TEXT PRIMARY KEY,
@@ -161,6 +179,17 @@ export function initializeAuthSchema(database: DatabaseSync): void {
       ON admin_sessions(admin_id, expires_at)
       WHERE revoked_at IS NULL;
 
+    CREATE TABLE IF NOT EXISTS admin_trusted_devices (
+      token_hash TEXT PRIMARY KEY,
+      admin_id TEXT NOT NULL REFERENCES administrators(id),
+      created_at INTEGER NOT NULL,
+      last_seen_at INTEGER NOT NULL,
+      revoked_at INTEGER
+    );
+
+    CREATE INDEX IF NOT EXISTS admin_trusted_devices_admin_idx
+      ON admin_trusted_devices(admin_id, revoked_at);
+
     CREATE TABLE IF NOT EXISTS admin_audit_log (
       id TEXT PRIMARY KEY,
       actor_id TEXT NOT NULL,
@@ -202,6 +231,12 @@ export function initializeAuthSchema(database: DatabaseSync): void {
   database.exec(
     "CREATE INDEX IF NOT EXISTS players_leaderboard_visible_idx ON players(leaderboard_visible)",
   );
+  const playerSessionColumns = database
+    .prepare("PRAGMA table_info(player_sessions)")
+    .all() as Array<{ name: string }>;
+  if (!playerSessionColumns.some((column) => column.name === "device_token_hash")) {
+    database.exec("ALTER TABLE player_sessions ADD COLUMN device_token_hash TEXT");
+  }
   database
     .prepare(
       `UPDATE player_sessions SET revoked_at = ?
@@ -249,6 +284,49 @@ function setSessionCookie(response: Response, token: string, secure: boolean): v
     attributes.push("Secure");
   }
   response.setHeader("Set-Cookie", attributes.join("; "));
+}
+
+function setTrustedDeviceCookie(
+  response: Response,
+  token: string,
+  secure: boolean,
+): void {
+  const attributes = [
+    `${TRUSTED_DEVICE_COOKIE_NAME}=${token}`,
+    "Path=/",
+    "HttpOnly",
+    "SameSite=Lax",
+    `Max-Age=${TRUSTED_DEVICE_COOKIE_MAX_AGE_SECONDS}`,
+  ];
+  if (secure) {
+    attributes.push("Secure");
+  }
+  response.append("Set-Cookie", attributes.join("; "));
+}
+
+function clearTrustedDeviceCookie(response: Response, secure: boolean): void {
+  response.append(
+    "Set-Cookie",
+    `${TRUSTED_DEVICE_COOKIE_NAME}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0${
+      secure ? "; Secure" : ""
+    }`,
+  );
+}
+
+function setAdminTrustedDeviceCookie(
+  response: Response,
+  token: string,
+  secure: boolean,
+): void {
+  const attributes = [
+    `${ADMIN_TRUSTED_DEVICE_COOKIE_NAME}=${token}`,
+    "Path=/admin",
+    "HttpOnly",
+    "SameSite=Strict",
+    `Max-Age=${TRUSTED_DEVICE_COOKIE_MAX_AGE_SECONDS}`,
+  ];
+  if (secure) attributes.push("Secure");
+  response.append("Set-Cookie", attributes.join("; "));
 }
 
 function readCookie(request: Request, name: string): string | undefined {
@@ -576,7 +654,7 @@ export function createAuthApp(options: AuthAppOptions): Express {
     if (secureCookies) {
       attributes.push("Secure");
     }
-    response.setHeader("Set-Cookie", attributes.join("; "));
+    response.append("Set-Cookie", attributes.join("; "));
   };
   const auditAdminRequest = (
     request: Request,
@@ -597,6 +675,8 @@ export function createAuthApp(options: AuthAppOptions): Express {
         "games",
         "anomalies",
         "progress-resets",
+        "players",
+        "operations",
         "administrators",
         "audit-logs",
       ]);
@@ -610,9 +690,14 @@ export function createAuthApp(options: AuthAppOptions): Express {
       const targetType = targetIndex >= 0 ? segments[targetIndex]! : "admin";
       const candidateTargetId =
         targetIndex >= 0 ? segments[targetIndex + 1] : undefined;
+      const queryGameId =
+        targetType === "players" && typeof request.query.gameId === "string"
+          ? request.query.gameId
+          : undefined;
+      const targetCandidate = candidateTargetId || queryGameId;
       const targetId =
-        candidateTargetId && /^[A-Za-z0-9_-]{1,128}$/.test(candidateTargetId)
-          ? candidateTargetId
+        targetCandidate && /^[A-Za-z0-9_-]{1,128}$/.test(targetCandidate)
+          ? targetCandidate
           : null;
       const route = `/${segments
         .map((segment) =>
@@ -725,6 +810,14 @@ export function createAuthApp(options: AuthAppOptions): Express {
     emailVerified: true,
     nickname: player.nickname,
     leaderboardVisible: player.leaderboard_visible === 1,
+    currentGameId: (
+      options.database
+        .prepare(
+          `SELECT game_id FROM game_participants
+           WHERE player_id = ? AND status = 'playing'`,
+        )
+        .get(player.id) as { game_id: string } | undefined
+    )?.game_id ?? null,
     totalCollectedSoFar: (
       options.database
         .prepare(
@@ -737,6 +830,54 @@ export function createAuthApp(options: AuthAppOptions): Express {
   app.disable("x-powered-by");
   app.use(express.json({ limit: "512kb" }));
   app.use(express.urlencoded({ extended: false, limit: "16kb" }));
+  const webDirectory = fileURLToPath(new URL("../web/", import.meta.url));
+  app.get("/app/config.js", (_request, response) => {
+    response
+      .set({
+        "Cache-Control": "no-store",
+        "Content-Type": "application/javascript; charset=utf-8",
+        "X-Content-Type-Options": "nosniff",
+      })
+      .send(
+        `window.LBS_CONFIG = Object.freeze({ googleMapsApiKey: ${JSON.stringify(options.googleMapsApiKey ?? "")} });`,
+      );
+  });
+  app.use("/app", express.static(webDirectory, { index: "index.html" }));
+  app.get("/", (_request, response) => {
+    response.type("html").send(`<!doctype html>
+<html lang="zh-Hant">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="light">
+    <title>LBS 虛擬尋寶 API</title>
+    <style>
+      body { margin: 0; padding: 2rem 1rem; background: #f4f7f5; color: #18332b; font: 16px/1.6 system-ui, sans-serif; }
+      main { max-width: 40rem; margin: 8vh auto; padding: 2rem; border: 1px solid #d6e3dc; border-radius: 1rem; background: white; box-shadow: 0 1rem 3rem #18332b12; }
+      h1 { margin-top: 0; }
+      .status { color: #176b45; font-weight: 700; }
+      li { margin: .6rem 0; }
+      a { color: #145c9e; }
+      code { padding: .15rem .35rem; border-radius: .25rem; background: #eef3f1; }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>LBS 虛擬尋寶</h1>
+      <p class="status">API 服務運作中</p>
+      <p>玩家與管理員網頁介面已就緒，請由此進入。</p>
+      <p><a href="/app">開啟 LBS 虛擬尋寶</a></p>
+      <h2>可試用的 API</h2>
+      <ul>
+        <li><a href="/leaderboard"><code>GET /leaderboard</code></a>：查看公開排行榜</li>
+        <li><a href="/games"><code>GET /games</code></a>：查看已發布遊戲（需玩家登入）</li>
+        <li><a href="/auth/me"><code>GET /auth/me</code></a>：查看目前登入狀態（需玩家登入）</li>
+      </ul>
+      <p>玩家登入需要設定可用的 SMTP 郵件服務，才能接收 Email 登入連結。</p>
+    </main>
+  </body>
+</html>`);
+  });
 
   app.post(
     "/admin/auth/magic-links",
@@ -756,6 +897,27 @@ export function createAuthApp(options: AuthAppOptions): Express {
         .prepare("SELECT id FROM administrators WHERE email = ? AND active = 1")
         .get(email) as { id: string } | undefined;
       if (admin) {
+        const trustedDeviceToken = readCookie(
+          request,
+          ADMIN_TRUSTED_DEVICE_COOKIE_NAME,
+        );
+        if (trustedDeviceToken) {
+          const trustedDevice = options.database
+            .prepare(
+              `SELECT 1 FROM admin_trusted_devices d
+               JOIN administrators a ON a.id = d.admin_id
+               WHERE d.token_hash = ? AND d.admin_id = ? AND a.email = ?
+                 AND d.revoked_at IS NULL AND a.active = 1`,
+            )
+            .get(hashToken(trustedDeviceToken), admin.id, email);
+          if (trustedDevice) {
+            response.status(202).json({
+              trustedDevice: true,
+              message: "此裝置已受信任，正在為你登入。",
+            });
+            return;
+          }
+        }
         const token = createToken();
         const tokenHash = hashToken(token);
         const timestamp = now();
@@ -784,7 +946,7 @@ export function createAuthApp(options: AuthAppOptions): Express {
         }
       }
       response.status(202).json({
-        message: "若管理員帳號有效，系統將寄送一次性登入連結。",
+        message: "若管理員帳號有效，系統將寄送首次裝置確認連結。",
       });
     },
   );
@@ -800,23 +962,31 @@ export function createAuthApp(options: AuthAppOptions): Express {
         "Cache-Control": "no-store",
         "Referrer-Policy": "no-referrer",
         "Content-Security-Policy":
-          "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'",
+          "default-src 'none'; style-src 'self' https://fonts.googleapis.com; font-src https://fonts.gstatic.com; img-src 'self'; script-src 'self'; connect-src 'self'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'",
       })
       .type("html")
       .send(
         `<!doctype html>
 <html lang="zh-Hant">
-  <meta charset="utf-8">
-  <meta name="referrer" content="no-referrer">
-  <title>管理員登入</title>
-  <body>
-    <main>
-      <h1>管理員登入</h1>
-      <p>按下按鈕完成 Email 驗證，接著輸入驗證器的一次性密碼。</p>
-      <form method="post" action="/admin/auth/verify">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="referrer" content="no-referrer">
+    <title>管理員登入｜LBS 虛擬尋寶</title>
+    <link rel="stylesheet" href="/app/style.css">
+    <script src="/app/verify.js" defer></script>
+  </head>
+  <body class="verification-page">
+    <main class="auth-card">
+      <img class="brand-logo" src="/app/mustard-seed-logo.png" alt="芥菜總會標誌">
+      <p class="eyebrow">管理員登入</p>
+      <h1>確認 Email</h1>
+      <p class="muted">首次在此裝置確認後，即可登入管理工作區。</p>
+      <form data-verification="admin">
         <input type="hidden" name="token" value="${escapeHtml(token)}">
-        <button type="submit">確認登入</button>
+        <button class="button button-primary" type="submit">確認並繼續</button>
       </form>
+      <p class="form-error" role="alert" aria-live="polite"></p>
     </main>
   </body>
 </html>`,
@@ -830,13 +1000,11 @@ export function createAuthApp(options: AuthAppOptions): Express {
     }
     const tokenHash = hashToken(request.body.token);
     const timestamp = now();
-    const challengeToken = createToken();
     beginWriteTransaction(options.database);
     try {
       const magicLink = options.database
         .prepare(
-          `SELECT l.admin_id, l.expires_at, l.consumed_at,
-                  a.totp_secret_encrypted
+          `SELECT l.admin_id, l.expires_at, l.consumed_at
            FROM admin_magic_links l
            JOIN administrators a ON a.id = l.admin_id
            WHERE l.token_hash = ? AND a.active = 1`,
@@ -846,7 +1014,6 @@ export function createAuthApp(options: AuthAppOptions): Express {
             admin_id: string;
             expires_at: number;
             consumed_at: number | null;
-            totp_secret_encrypted: string | null;
           }
         | undefined;
       if (
@@ -864,24 +1031,38 @@ export function createAuthApp(options: AuthAppOptions): Express {
            WHERE token_hash = ? AND consumed_at IS NULL`,
         )
         .run(timestamp, tokenHash);
+      const trustedDeviceToken = createToken();
       options.database
         .prepare(
-          `INSERT INTO admin_auth_challenges (
-            token_hash, admin_id, created_at, expires_at
-          ) VALUES (?, ?, ?, ?)`,
+          `INSERT INTO admin_trusted_devices (
+            token_hash, admin_id, created_at, last_seen_at, revoked_at
+          ) VALUES (?, ?, ?, ?, NULL)`,
         )
         .run(
-          hashToken(challengeToken),
+          hashToken(trustedDeviceToken),
           magicLink.admin_id,
           timestamp,
-          timestamp + ADMIN_CHALLENGE_TTL_MS,
+          timestamp,
+        );
+      issueAdminSession(magicLink.admin_id, response, timestamp);
+      setAdminTrustedDeviceCookie(response, trustedDeviceToken, secureCookies);
+      options.database
+        .prepare(
+          `INSERT INTO admin_audit_log (
+            id, actor_id, action, target_type, target_id, result,
+            summary_json, created_at
+          ) VALUES (?, ?, 'admin_email_login', 'administrator', ?, 'success', ?, ?)`,
+        )
+        .run(
+          createId(),
+          magicLink.admin_id,
+          magicLink.admin_id,
+          JSON.stringify({ method: "email_magic_link", deviceTrusted: true }),
+          timestamp,
         );
       options.database.exec("COMMIT");
       response.setHeader("Cache-Control", "no-store");
-      response.json({
-        challengeToken,
-        setupRequired: magicLink.totp_secret_encrypted === null,
-      });
+      response.json({ authenticated: true });
     } catch (error) {
       options.database.exec("ROLLBACK");
       throw error;
@@ -1088,6 +1269,54 @@ export function createAuthApp(options: AuthAppOptions): Express {
   app.post("/admin/auth/totp/verify", (request, response) => {
     completeAdminTotp(request, response, false);
   });
+  app.post("/admin/auth/device-login", (request: Request, response: Response) => {
+    response.setHeader("Cache-Control", "no-store");
+    const trustedDeviceToken = readCookie(
+      request,
+      ADMIN_TRUSTED_DEVICE_COOKIE_NAME,
+    );
+    if (!trustedDeviceToken) {
+      response.status(401).json({ error: "此裝置尚未確認 Email，請先完成一次確認。" });
+      return;
+    }
+    const tokenHash = hashToken(trustedDeviceToken);
+    const timestamp = now();
+    const admin = options.database
+      .prepare(
+        `SELECT a.id, a.role FROM admin_trusted_devices d
+         JOIN administrators a ON a.id = d.admin_id
+         WHERE d.token_hash = ? AND d.revoked_at IS NULL AND a.active = 1`,
+      )
+      .get(tokenHash) as
+      | { id: string; role: "owner" | "admin" | "auditor" }
+      | undefined;
+    if (!admin) {
+      response.status(401).json({ error: "此裝置信任已失效，請重新確認 Email。" });
+      return;
+    }
+    options.database
+      .prepare(
+        `UPDATE admin_trusted_devices SET last_seen_at = ?
+         WHERE token_hash = ? AND revoked_at IS NULL`,
+      )
+      .run(timestamp, tokenHash);
+    issueAdminSession(admin.id, response, timestamp);
+    options.database
+      .prepare(
+        `INSERT INTO admin_audit_log (
+          id, actor_id, action, target_type, target_id, result,
+          summary_json, created_at
+        ) VALUES (?, ?, 'admin_trusted_device_login', 'administrator', ?, 'success', ?, ?)`,
+      )
+      .run(
+        createId(),
+        admin.id,
+        admin.id,
+        JSON.stringify({ method: "trusted_device" }),
+        timestamp,
+      );
+    response.json({ authenticated: true, admin: { role: admin.role } });
+  });
   app.post("/admin/auth/logout", (request: Request, response: Response) => {
     const token = adminSessionToken(request);
     if (token) {
@@ -1139,6 +1368,27 @@ export function createAuthApp(options: AuthAppOptions): Express {
         return;
       }
 
+      const trustedDeviceToken = readCookie(
+        request,
+        TRUSTED_DEVICE_COOKIE_NAME,
+      );
+      if (trustedDeviceToken) {
+        const alreadyTrusted = options.database
+          .prepare(
+            `SELECT 1 FROM player_trusted_devices d
+             JOIN players p ON p.id = d.player_id
+             WHERE d.token_hash = ? AND p.email = ? AND d.revoked_at IS NULL`,
+          )
+          .get(hashToken(trustedDeviceToken), email);
+        if (alreadyTrusted) {
+          response.status(202).json({
+            trustedDevice: true,
+            message: "此裝置已受信任，正在為你登入。",
+          });
+          return;
+        }
+      }
+
       const token = createToken();
       const tokenHash = hashToken(token);
       const timestamp = now();
@@ -1181,23 +1431,31 @@ export function createAuthApp(options: AuthAppOptions): Express {
         "Cache-Control": "no-store",
         "Referrer-Policy": "no-referrer",
         "Content-Security-Policy":
-          "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'",
+          "default-src 'none'; style-src 'self' https://fonts.googleapis.com; font-src https://fonts.gstatic.com; img-src 'self'; script-src 'self'; connect-src 'self'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'",
       })
       .type("html")
       .send(
         `<!doctype html>
 <html lang="zh-Hant">
-  <meta charset="utf-8">
-  <meta name="referrer" content="no-referrer">
-  <title>確認登入</title>
-  <body>
-    <main>
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="referrer" content="no-referrer">
+    <title>確認登入｜LBS 虛擬尋寶</title>
+    <link rel="stylesheet" href="/app/style.css">
+    <script src="/app/verify.js" defer></script>
+  </head>
+  <body class="verification-page">
+    <main class="auth-card">
+      <img class="brand-logo" src="/app/mustard-seed-logo.png" alt="芥菜總會標誌">
+      <p class="eyebrow">玩家登入</p>
       <h1>確認登入</h1>
-      <p>按下按鈕完成 Email 驗證並登入。</p>
-      <form method="post" action="/auth/verify">
+      <p class="muted">按下按鈕完成 Email 驗證並返回尋寶地圖。</p>
+      <form data-verification="player">
         <input type="hidden" name="token" value="${escapeHtml(token)}">
-        <button type="submit">確認登入</button>
+        <button class="button button-primary" type="submit">確認登入</button>
       </form>
+      <p class="form-error" role="alert" aria-live="polite"></p>
     </main>
   </body>
 </html>`,
@@ -1212,6 +1470,7 @@ export function createAuthApp(options: AuthAppOptions): Express {
 
     const tokenHash = hashToken(request.body.token);
     const timestamp = now();
+    pauseStalePlayerGameSessions(options.database, timestamp);
     beginWriteTransaction(options.database);
     try {
       const magicLink = options.database
@@ -1227,6 +1486,49 @@ export function createAuthApp(options: AuthAppOptions): Express {
         return;
       }
 
+      const existingPlayer = options.database
+        .prepare("SELECT id FROM players WHERE email = ?")
+        .get(magicLink.email) as { id: string } | undefined;
+      if (existingPlayer) {
+        const activeGame = options.database
+          .prepare(
+            `SELECT game_id, device_token_hash,
+                    COALESCE(last_heartbeat_at, updated_at) AS last_heartbeat_at
+             FROM game_participants WHERE player_id = ? AND status = 'playing'`,
+          )
+          .get(existingPlayer.id) as {
+            game_id: string;
+            device_token_hash: string | null;
+            last_heartbeat_at: number;
+          } | undefined;
+        if (activeGame) {
+          const stale = timestamp - activeGame.last_heartbeat_at >= PLAYER_GAME_HEARTBEAT_TIMEOUT_MS;
+          if (!stale) {
+            options.database.exec("ROLLBACK");
+            response.status(409).json({
+              code: "PLAYER_GAME_SESSION_ACTIVE",
+              error: "玩家仍在另一裝置進行遊戲；請先暫停，或等待心跳逾時後再登入。",
+            });
+            return;
+          }
+          if (stale) {
+            options.database
+              .prepare(
+                `UPDATE game_participants SET status = 'paused', device_token_hash = NULL,
+                   last_heartbeat_at = NULL, updated_at = ?
+                 WHERE game_id = ? AND player_id = ? AND status = 'playing'`,
+              )
+              .run(timestamp, activeGame.game_id, existingPlayer.id);
+            options.database
+              .prepare(
+                `UPDATE location_samples SET expires_at = ?
+                 WHERE game_id = ? AND player_id = ? AND expires_at IS NULL`,
+              )
+              .run(timestamp + 24 * 60 * 60 * 1000, activeGame.game_id, existingPlayer.id);
+          }
+        }
+      }
+
       const consumed = options.database
         .prepare(
           `UPDATE magic_links SET consumed_at = ?
@@ -1240,21 +1542,8 @@ export function createAuthApp(options: AuthAppOptions): Express {
       }
 
       const player = createPlayer(options.database, magicLink.email, timestamp, createId);
-      const activeGame = options.database
-        .prepare(
-          `SELECT game_id FROM game_participants
-           WHERE player_id = ? AND status = 'playing'`,
-        )
-        .get(player.id);
-      if (activeGame) {
-        options.database.exec("ROLLBACK");
-        response.status(409).json({
-          error: "遊戲進行中無法在其他裝置登入；請先暫停或結束遊戲。",
-        });
-        return;
-      }
-
       const sessionToken = createToken();
+      const trustedDeviceToken = createToken();
       options.database
         .prepare(
           "UPDATE player_sessions SET revoked_at = ? WHERE player_id = ? AND revoked_at IS NULL",
@@ -1262,14 +1551,132 @@ export function createAuthApp(options: AuthAppOptions): Express {
         .run(timestamp, player.id);
       options.database
         .prepare(
-          `INSERT INTO player_sessions (token_hash, player_id, created_at, revoked_at)
-           VALUES (?, ?, ?, NULL)`,
+          `INSERT INTO player_sessions (
+            token_hash, player_id, device_token_hash, created_at, revoked_at
+          ) VALUES (?, ?, ?, ?, NULL)`,
         )
-        .run(hashToken(sessionToken), player.id, timestamp);
+        .run(hashToken(sessionToken), player.id, hashToken(trustedDeviceToken), timestamp);
+      options.database
+        .prepare(
+          `INSERT INTO player_trusted_devices (
+            token_hash, player_id, created_at, last_seen_at, revoked_at
+          ) VALUES (?, ?, ?, ?, NULL)`,
+        )
+        .run(hashToken(trustedDeviceToken), player.id, timestamp, timestamp);
 
       options.database.exec("COMMIT");
       setSessionCookie(response, sessionToken, secureCookies);
+      setTrustedDeviceCookie(response, trustedDeviceToken, secureCookies);
+      response.setHeader("Cache-Control", "no-store");
       response.status(200).json({
+        player: {
+          id: player.id,
+          anonymousCode: player.anonymous_code,
+          email: player.email,
+          emailVerified: true,
+        },
+      });
+    } catch (error) {
+      options.database.exec("ROLLBACK");
+      throw error;
+    }
+  });
+
+  app.post("/auth/device-login", (request: Request, response: Response) => {
+    response.setHeader("Cache-Control", "no-store");
+    const trustedDeviceToken = readCookie(
+      request,
+      TRUSTED_DEVICE_COOKIE_NAME,
+    );
+    if (!trustedDeviceToken) {
+      response.status(401).json({ error: "此裝置尚未完成 Email 確認。" });
+      return;
+    }
+
+    const tokenHash = hashToken(trustedDeviceToken);
+    const timestamp = now();
+    const sessionToken = createToken();
+    pauseStalePlayerGameSessions(options.database, timestamp);
+    beginWriteTransaction(options.database);
+    try {
+      const player = options.database
+        .prepare(
+          `SELECT p.id, p.email, p.anonymous_code, p.email_verified_at,
+                  p.nickname, p.leaderboard_visible
+           FROM player_trusted_devices d
+           JOIN players p ON p.id = d.player_id
+           WHERE d.token_hash = ? AND d.revoked_at IS NULL`,
+        )
+        .get(tokenHash) as PlayerRecord | undefined;
+      if (!player) {
+        options.database.exec("ROLLBACK");
+        clearTrustedDeviceCookie(response, secureCookies);
+        response.status(401).json({ error: "此裝置的信任已失效，請以 Email 確認。" });
+        return;
+      }
+
+      const activeGame = options.database
+        .prepare(
+          `SELECT game_id, device_token_hash,
+                  COALESCE(last_heartbeat_at, updated_at) AS last_heartbeat_at
+           FROM game_participants WHERE player_id = ? AND status = 'playing'`,
+        )
+        .get(player.id) as {
+          game_id: string;
+          device_token_hash: string | null;
+          last_heartbeat_at: number;
+        } | undefined;
+      if (activeGame) {
+        const sameDevice = activeGame.device_token_hash === tokenHash;
+        const stale = timestamp - activeGame.last_heartbeat_at >= PLAYER_GAME_HEARTBEAT_TIMEOUT_MS;
+        if (!sameDevice && !stale) {
+          options.database.exec("ROLLBACK");
+          response.status(409).json({
+            code: "PLAYER_GAME_SESSION_ACTIVE",
+            error: "玩家仍在另一裝置進行遊戲；請先暫停，或等待心跳逾時後再登入。",
+          });
+          return;
+        }
+        if (stale) {
+          options.database
+            .prepare(
+              `UPDATE game_participants SET status = 'paused', device_token_hash = NULL,
+                 last_heartbeat_at = NULL, updated_at = ?
+               WHERE game_id = ? AND player_id = ? AND status = 'playing'`,
+            )
+            .run(timestamp, activeGame.game_id, player.id);
+          options.database
+            .prepare(
+              `UPDATE location_samples SET expires_at = ?
+               WHERE game_id = ? AND player_id = ? AND expires_at IS NULL`,
+            )
+            .run(timestamp + 24 * 60 * 60 * 1000, activeGame.game_id, player.id);
+        }
+      }
+
+      options.database
+        .prepare(
+          "UPDATE player_sessions SET revoked_at = ? WHERE player_id = ? AND revoked_at IS NULL",
+        )
+        .run(timestamp, player.id);
+      options.database
+        .prepare(
+          `INSERT INTO player_sessions (
+            token_hash, player_id, device_token_hash, created_at, revoked_at
+          ) VALUES (?, ?, ?, ?, NULL)`,
+        )
+        .run(hashToken(sessionToken), player.id, tokenHash, timestamp);
+      options.database
+        .prepare(
+          `UPDATE player_trusted_devices SET last_seen_at = ?
+           WHERE token_hash = ? AND revoked_at IS NULL`,
+        )
+        .run(timestamp, tokenHash);
+      options.database.exec("COMMIT");
+
+      setSessionCookie(response, sessionToken, secureCookies);
+      setTrustedDeviceCookie(response, trustedDeviceToken, secureCookies);
+      response.json({
         player: {
           id: player.id,
           anonymousCode: player.anonymous_code,
@@ -1289,6 +1696,22 @@ export function createAuthApp(options: AuthAppOptions): Express {
     if (!player) {
       response.status(401).json({ error: "請先登入。" });
       return;
+    }
+
+    const trustedDeviceToken = readCookie(
+      request,
+      TRUSTED_DEVICE_COOKIE_NAME,
+    );
+    if (trustedDeviceToken) {
+      const trustedDevice = options.database
+        .prepare(
+          `SELECT 1 FROM player_trusted_devices
+           WHERE token_hash = ? AND player_id = ? AND revoked_at IS NULL`,
+        )
+        .get(hashToken(trustedDeviceToken), player.id);
+      if (trustedDevice) {
+        setTrustedDeviceCookie(response, trustedDeviceToken, secureCookies);
+      }
     }
 
     response.json({ player: serializePlayer(player) });
@@ -1376,6 +1799,9 @@ export function createAuthApp(options: AuthAppOptions): Express {
       options.database
         .prepare("DELETE FROM player_sessions WHERE player_id = ?")
         .run(player.id);
+      options.database
+        .prepare("DELETE FROM player_trusted_devices WHERE player_id = ?")
+        .run(player.id);
       const deletion = options.database
         .prepare("DELETE FROM players WHERE id = ?")
         .run(player.id);
@@ -1399,6 +1825,7 @@ export function createAuthApp(options: AuthAppOptions): Express {
         secureCookies ? "; Secure" : ""
       }`,
     );
+    clearTrustedDeviceCookie(response, secureCookies);
     response.status(204).end();
   });
 
@@ -1509,6 +1936,64 @@ export function createAuthApp(options: AuthAppOptions): Express {
     response.status(204).end();
   });
 
+  app.post("/auth/device/forget", (request: Request, response: Response) => {
+    response.setHeader("Cache-Control", "no-store");
+    const player = authenticatedPlayer(request);
+    if (!player) {
+      response.status(401).json({ error: "請先登入。" });
+      return;
+    }
+    const activeGame = options.database
+      .prepare(
+        `SELECT game_id FROM game_participants
+         WHERE player_id = ? AND status = 'playing'`,
+      )
+      .get(player.id);
+    if (activeGame) {
+      response.status(409).json({
+        error: "請先暫停目前遊戲，再忘記此裝置。",
+      });
+      return;
+    }
+
+    const timestamp = now();
+    const trustedDeviceToken = readCookie(
+      request,
+      TRUSTED_DEVICE_COOKIE_NAME,
+    );
+    const sessionToken = readCookie(request, SESSION_COOKIE_NAME);
+    beginWriteTransaction(options.database);
+    try {
+      options.database
+        .prepare(
+          `UPDATE player_sessions SET revoked_at = ?
+           WHERE token_hash = ? AND player_id = ? AND revoked_at IS NULL`,
+        )
+        .run(timestamp, hashToken(sessionToken ?? ""), player.id);
+      if (trustedDeviceToken) {
+        options.database
+          .prepare(
+            `UPDATE player_trusted_devices SET revoked_at = ?
+             WHERE token_hash = ? AND player_id = ? AND revoked_at IS NULL`,
+          )
+          .run(timestamp, hashToken(trustedDeviceToken), player.id);
+      }
+      options.database.exec("COMMIT");
+    } catch (error) {
+      options.database.exec("ROLLBACK");
+      throw error;
+    }
+
+    response.setHeader(
+      "Set-Cookie",
+      `${SESSION_COOKIE_NAME}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0${
+        secureCookies ? "; Secure" : ""
+      }`,
+    );
+    clearTrustedDeviceCookie(response, secureCookies);
+    response.status(204).end();
+  });
+
   const gameRouterOptions = {
     database: options.database,
     now,
@@ -1546,13 +2031,14 @@ export function createAuthApp(options: AuthAppOptions): Express {
     }
     const admin = findAdminSession(request);
     if (!admin) {
-      response.status(401).json({ error: "請先完成管理員 Email 與 TOTP 驗證。" });
+      response.status(401).json({ error: "請先確認此裝置的管理員 Email 並登入。" });
       return;
     }
     const isAuditorRead =
       admin.role === "auditor" &&
       request.method === "GET" &&
-      (request.path === "/games/anomalies" ||
+      (request.path === "/auth/me" ||
+        request.path === "/games/anomalies" ||
         request.path === "/audit-logs");
     if (admin.role === "auditor" && !isAuditorRead) {
       response.status(403).json({ error: "此管理員角色無權執行此操作。" });
@@ -1831,6 +2317,15 @@ export function createAuthApp(options: AuthAppOptions): Express {
     });
   });
   app.use("/admin", auditAdminRequest, requireAdminAccess);
+  app.get("/admin/auth/me", (request, response) => {
+    const admin = findAdminSession(request);
+    if (!admin) {
+      response.status(401).json({ error: "請先確認此裝置的管理員 Email 並登入。" });
+      return;
+    }
+    response.setHeader("Cache-Control", "no-store");
+    response.json({ admin: { role: admin.role } });
+  });
   app.use("/admin/administrators", administratorsRouter);
   app.use("/admin/audit-logs", auditLogRouter);
   app.use(
@@ -1840,6 +2335,27 @@ export function createAuthApp(options: AuthAppOptions): Express {
 
   const errorHandler: ErrorRequestHandler = (error, _request, response, next) => {
     if (error instanceof EmailDeliveryError) {
+      const cause = error.cause;
+      if (typeof cause === "object" && cause !== null) {
+        const smtpFailure = cause as {
+          code?: unknown;
+          command?: unknown;
+          responseCode?: unknown;
+        };
+        console.error("Magic Link SMTP delivery failed", {
+          code: typeof smtpFailure.code === "string" ? smtpFailure.code : undefined,
+          command:
+            typeof smtpFailure.command === "string"
+              ? smtpFailure.command
+              : undefined,
+          responseCode:
+            typeof smtpFailure.responseCode === "number"
+              ? smtpFailure.responseCode
+              : undefined,
+        });
+      } else {
+        console.error("Magic Link SMTP delivery failed without error details");
+      }
       response.status(503).json({ error: "目前無法寄送登入連結，請稍後再試。" });
       return;
     }

@@ -1,0 +1,270 @@
+<!doctype html>
+<html lang="zh-Hant">
+  <head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="theme-color" content="#f7f5f0">
+    <meta name="description" content="選擇一場尋寶遊戲，循著線索展開探索。">
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-title" content="LBS 尋寶">
+    <link rel="manifest" href="/app/manifest.json">
+    <title>LBS 虛擬尋寶</title>
+    <link rel="icon" type="image/png" href="/app/icons/icon-192.png">
+    <link rel="apple-touch-icon" href="/app/icons/icon-192.png">
+    <link rel="stylesheet" href="/app/style.css">
+    <script src="/app/config.js"></script>
+    <script type="module" src="/app/app.js"></script>
+  </head>
+  <body>
+    <header class="topbar">
+      <a class="brand" href="/app" aria-label="LBS 虛擬尋寶首頁">
+        <img src="/app/mustard-seed-logo.png" alt="">
+        <span>LBS 虛擬尋寶</span>
+      </a>
+      <div id="account-bar" class="account-bar" hidden>
+        <span id="account-label" class="account-label"></span>
+        <button id="logout-button" class="button button-subtle" type="button">登出</button>
+      </div>
+    </header>
+
+    <main class="page-shell">
+      <section id="auth-view" class="auth-layout" aria-labelledby="welcome-title">
+        <div class="welcome-copy">
+          <p class="eyebrow">探索就在附近</p>
+          <h1 id="welcome-title">每一段路，<br>都可能藏著驚喜。</h1>
+          <p>選擇一場尋寶遊戲，跟著地圖走進真實世界，發現藏在身邊的故事。</p>
+          <img class="welcome-logo" src="/app/mustard-seed-logo.png" alt="芥菜總會標誌">
+        </div>
+        <div class="auth-card">
+          <p class="eyebrow">歡迎回來</p>
+          <h2>登入尋寶地圖</h2>
+          <p class="muted">首次使用或更換裝置時以 Email 確認；已信任的裝置會自動登入。</p>
+          <div class="segmented-control" role="group" aria-label="選擇登入身份">
+            <button id="player-login-tab" class="segment is-active" type="button" aria-pressed="true">玩家登入</button>
+            <button id="admin-login-tab" class="segment" type="button" aria-pressed="false">管理員登入</button>
+          </div>
+          <form id="magic-link-form" class="stack-form">
+            <label for="login-email">電子郵件</label>
+            <input id="login-email" name="email" type="email" autocomplete="email" placeholder="name@example.com" maxlength="254" required>
+            <button id="magic-link-submit" class="button button-primary button-wide" type="submit">寄送登入連結</button>
+          </form>
+          <button id="trusted-device-login" class="button button-primary button-wide" type="button" hidden>以此信任裝置繼續</button>
+          <p id="auth-message" class="notice" role="status" aria-live="polite"></p>
+          <p id="auth-error" class="form-error" role="alert" aria-live="polite"></p>
+          <p class="fine-print">繼續使用即表示你同意以瀏覽器前景定位參與遊戲。</p>
+        </div>
+      </section>
+
+      <section id="player-view" hidden>
+        <div class="page-heading">
+          <div>
+            <p class="eyebrow">尋寶主選單</p>
+            <h1>準備好開始探索了嗎？</h1>
+            <p class="muted">選擇一場遊戲，進入地圖開始尋寶。</p>
+          </div>
+          <button id="profile-toggle" class="button button-subtle" type="button">個人資料</button>
+        </div>
+
+        <section id="profile-panel" class="surface profile-panel" hidden>
+          <div>
+            <p class="eyebrow">個人資料</p>
+            <h2>你的尋寶設定</h2>
+          </div>
+          <form id="profile-form" class="profile-form">
+            <label for="nickname">暱稱 <span class="muted">(最多 30 字)</span></label>
+            <input id="nickname" name="nickname" type="text" maxlength="30" autocomplete="nickname" placeholder="設定你的顯示名稱">
+            <label class="check-row"><input id="leaderboard-visible" type="checkbox"> 在排行榜公開顯示</label>
+            <button class="button button-primary" type="submit">儲存設定</button>
+          </form>
+          <p id="profile-message" class="notice" role="status" aria-live="polite"></p>
+          <div class="account-deletion-panel">
+            <h3>永久刪除玩家帳號</h3>
+            <p class="muted">刪除後會撤銷登入、移除 Email 與排行榜貢獻；仍在保留期限內的事件會去識別化保存。此操作無法復原。</p>
+            <button id="delete-player-account" class="button button-danger" type="button">永久刪除我的帳號</button>
+            <p id="account-deletion-message" class="form-error" role="alert" aria-live="polite"></p>
+          </div>
+          <div class="account-deletion-panel">
+            <h3>此裝置的登入信任</h3>
+            <p class="muted">登出會保留此裝置的信任。若這是共用裝置，請在登出時一併移除信任。</p>
+            <button id="forget-trusted-device" class="button button-subtle" type="button">登出並忘記此裝置</button>
+          </div>
+        </section>
+
+        <div class="stats-row">
+          <article class="stat-card"><span class="stat-icon">✦</span><div><strong id="history-total">0</strong><span>歷史累計搜集</span></div></article>
+          <article class="stat-card"><span class="stat-icon">♧</span><div><strong id="available-games">0</strong><span>可參加遊戲</span></div></article>
+        </div>
+
+        <section class="section-block" aria-labelledby="games-heading">
+          <div class="section-heading"><div><p class="eyebrow">活動清單</p><h2 id="games-heading">挑選你的下一場冒險</h2></div><button id="refresh-player" class="button button-subtle" type="button">重新整理</button></div>
+          <div id="player-games" class="game-grid"></div>
+          <p id="player-empty" class="empty-state" hidden>目前沒有已發布的尋寶遊戲，請稍後再來看看。</p>
+          <p id="player-error" class="form-error" role="alert" aria-live="polite"></p>
+        </section>
+
+        <section class="section-block leaderboard-section" aria-labelledby="leaderboard-heading">
+          <div class="section-heading"><div><p class="eyebrow">跨遊戲累計</p><h2 id="leaderboard-heading">全站尋寶排行榜</h2></div><span class="top-three-label">TOP 3</span></div>
+          <div id="leaderboard" class="leaderboard-list"></div>
+          <p id="leaderboard-empty" class="empty-state" hidden>排行榜目前還沒有有效搜集紀錄。</p>
+        </section>
+      </section>
+
+      <section id="hunt-view" hidden>
+        <div class="hunt-heading">
+          <button id="back-to-games" class="button button-subtle" type="button">← 遊戲清單</button>
+          <div class="hunt-title"><p class="eyebrow">正在探索</p><h1 id="active-game-name">尋寶遊戲</h1></div>
+          <button id="pause-game" class="button button-subtle" type="button">暫停遊戲</button>
+        </div>
+        <section class="game-hud surface">
+          <div class="hud-item"><span>本場進度</span><strong><span id="collected-count">0</span><i>/</i><span id="target-count">0</span></strong></div>
+          <div class="hud-item"><span>歷史累計</span><strong id="hunt-total">0</strong></div>
+          <div class="hud-item hud-location"><span>目前定位</span><strong id="location-status">等待定位權限</strong></div>
+          <div id="accuracy-warning" class="inline-warning" hidden>定位精度不足，請移至空曠處或稍後再試。</div>
+        </section>
+        <section class="map-card">
+          <div class="map-toolbar"><div><p class="eyebrow">實境探索</p><h2>寶藏分布地圖</h2></div><button id="center-map" class="button button-subtle" type="button">◎ 回到我的位置</button></div>
+          <div id="player-map" class="map-frame" role="application" aria-label="尋寶地圖"></div>
+          <p id="player-map-message" class="map-message" role="status"></p>
+        </section>
+        <section class="section-block treasure-list-block"><div class="section-heading"><div><p class="eyebrow">附近線索</p><h2>探索中的寶藏</h2></div><span id="nearby-count" class="muted"></span></div><div id="nearby-treasures" class="treasure-list"></div></section>
+        <p id="hunt-error" class="form-error" role="alert" aria-live="polite"></p>
+      </section>
+
+      <section id="admin-view" hidden>
+        <div class="page-heading"><div><p class="eyebrow">管理模式</p><h1>遊戲與寶藏管理</h1><p class="muted">建立草稿、編輯地圖並確認活動狀態。</p></div><div class="role-pill">管理員工作區</div></div>
+        <nav id="admin-section-nav" class="admin-section-nav" aria-label="&#31649;&#29702;&#24037;&#20316;&#21312;&#23548;&#33322;">
+          <button id="admin-nav-games" class="admin-section-button is-active" data-admin-section="games" type="button" aria-pressed="true">&#36938;&#25138;&#33287;&#23542;&#34255;</button>
+          <button id="admin-nav-operations" class="admin-section-button" data-admin-section="operations" type="button" aria-pressed="false" hidden>&#29151;&#36939;&#27298;&#35222;</button>
+          <button id="admin-nav-accounts" class="admin-section-button" data-admin-section="accounts" type="button" aria-pressed="false" hidden>&#31649;&#29702;&#21729;&#24115;&#34399;</button>
+          <button id="admin-nav-audit" class="admin-section-button" data-admin-section="audit" type="button" aria-pressed="false" hidden>&#31245;&#26680;&#32000;&#37636;</button>
+          <button id="admin-nav-anomalies" class="admin-section-button" data-admin-section="anomalies" type="button" aria-pressed="false" hidden>&#30064;&#24120;&#35338;&#34399;&#26597;&#38321;</button>
+          <button id="admin-nav-progress-resets" class="admin-section-button" data-admin-section="progress-resets" type="button" aria-pressed="false" hidden>&#36914;&#24230;&#37325;&#32622;</button>
+        </nav>
+        <div id="admin-layout" class="admin-layout">
+          <aside class="admin-sidebar">
+            <div class="surface admin-games-panel"><div class="section-heading"><h2>遊戲清單</h2><button id="refresh-admin" class="icon-button" type="button" aria-label="重新整理遊戲">↻</button></div><div id="admin-games" class="admin-game-list"></div></div>
+            <form id="create-game-form" class="surface stack-form">
+              <p class="eyebrow">建立活動</p><h2>新增遊戲草稿</h2>
+              <label for="new-game-name">遊戲名稱</label><input id="new-game-name" name="name" maxlength="120" placeholder="例如：校園春日尋寶" required>
+              <label for="new-game-description">活動說明</label><textarea id="new-game-description" name="description" rows="3" maxlength="2000" placeholder="介紹活動與探索方式"></textarea>
+              <div class="form-grid"><label for="new-game-start">開始時間</label><input id="new-game-start" name="startsAt" type="datetime-local" required><label for="new-game-end">結束時間</label><input id="new-game-end" name="endsAt" type="datetime-local" required></div>
+              <label for="new-game-timezone">活動時區</label><input id="new-game-timezone" name="timezone" maxlength="80" required>
+              <div class="form-grid coordinates-grid"><label for="center-latitude">地圖中心緯度</label><input id="center-latitude" type="number" step="any" min="-90" max="90" value="25.033" required><label for="center-longitude">地圖中心經度</label><input id="center-longitude" type="number" step="any" min="-180" max="180" value="121.565" required></div>
+              <button class="button button-primary button-wide" type="submit">建立草稿</button><p id="admin-form-error" class="form-error" role="alert" aria-live="polite"></p>
+            </form>
+          </aside>
+          <div class="admin-main">
+            <section id="admin-game-panel" class="surface admin-game-panel" hidden>
+              <div class="admin-title-row"><div><p id="admin-game-status" class="eyebrow">草稿</p><h2 id="admin-active-game-name"></h2><p id="admin-game-meta" class="muted"></p></div><div id="game-actions" class="action-row"></div></div>
+              <div class="admin-tabs" role="tablist" aria-label="管理工具"><button class="admin-tab is-active" data-admin-tab="map" role="tab" aria-selected="true">地圖與寶藏</button><button class="admin-tab" data-admin-tab="import" role="tab" aria-selected="false">JSON 匯入</button><button class="admin-tab" data-admin-tab="test" role="tab" aria-selected="false">草稿定位測試</button></div>
+              <div id="admin-map-panel" class="admin-tab-panel">
+                <p id="admin-map-hint" class="map-hint">點擊地圖可新增寶藏；發布後座標與內容會鎖定。</p>
+                <div id="admin-map" class="map-frame admin-map-frame" role="application" aria-label="草稿遊戲編輯地圖"></div>
+                <p id="admin-map-message" class="map-message" role="status"></p>
+                <div id="admin-treasures" class="admin-treasure-list"></div>
+              </div>
+              <div id="admin-import-panel" class="admin-tab-panel" hidden><div class="import-card"><h3>預覽寶藏 JSON</h3><p class="muted">使用 schemaVersion 1 與 treasures 陣列；預覽不會寫入資料。有效列會以橘色標記顯示在草稿地圖。</p><label class="button button-subtle file-button">選擇 JSON 檔案<input id="treasure-file" type="file" accept="application/json,.json" hidden></label><div id="import-result" class="import-result" aria-live="polite"></div><button id="import-map-preview" class="button button-subtle" type="button" hidden>在地圖查看預覽</button><div id="import-actions" class="action-row" hidden></div></div></div>
+              <div id="admin-test-panel" class="admin-tab-panel" hidden><div class="import-card"><h3>隔離 Mock GPS 測試</h3><p class="muted">僅供未發布草稿測試，不建立玩家搜集紀錄或影響排行榜。</p><form id="mock-test-form" class="mock-test-form"><label for="mock-treasure">選擇寶藏</label><select id="mock-treasure" required></select><label for="mock-latitude">模擬緯度</label><input id="mock-latitude" type="number" step="any" min="-90" max="90" required><label for="mock-longitude">模擬經度</label><input id="mock-longitude" type="number" step="any" min="-180" max="180" required><label for="mock-accuracy">定位精度（公尺）</label><input id="mock-accuracy" type="number" min="0" step="any" value="10" required><button class="button button-primary" type="submit">執行隔離測試</button></form><p id="mock-test-result" class="notice" role="status" aria-live="polite"></p></div></div>
+            </section>
+            <section id="admin-empty-state" class="surface empty-state"><h2>先建立一場遊戲</h2><p>建立草稿後，就能在地圖上放置寶藏並預覽匯入資料。</p></section>
+          </div>
+        </div>
+        <section id="admin-operations-section" class="surface admin-tools-section" hidden>
+          <div class="section-heading"><div><p class="eyebrow">&#27963;&#21205;&#27010;&#27841;</p><h2>&#29151;&#36939;&#32113;&#35336;</h2></div><button id="refresh-admin-operations" class="icon-button" type="button" aria-label="&#37325;&#26032;&#36617;&#20837;&#29151;&#36939;&#32113;&#35336;">&#8635;</button></div>
+          <p id="admin-operations-message" class="notice" role="status" aria-live="polite"></p>
+          <div id="admin-operations-games" class="admin-record-list"></div>
+          <h3>&#20840;&#31449;&#26377;&#25928;&#25628;&#38598;&#21069;&#19977;&#21517;</h3>
+          <div id="admin-operations-leaderboard" class="admin-record-list"></div>
+          <h3>&#26597;&#35426;&#29609;&#23478;&#36914;&#24230;&#33287;&#25628;&#38598;&#20107;&#20214;</h3>
+          <form id="admin-operations-player-form" class="admin-create-form">
+            <label for="admin-operations-game">&#36938;&#25138;</label><select id="admin-operations-game" name="gameId" required></select>
+            <label for="admin-operations-code">玩家匿名代碼</label><input id="admin-operations-code" name="anonymousCode" minlength="3" maxlength="40" required>
+            <button class="button button-subtle" type="submit">&#26597;&#35426;</button>
+          </form>
+          <p id="admin-operations-player-message" class="notice" role="status" aria-live="polite"></p>
+          <div id="admin-operations-player-results" class="admin-record-list"></div>
+        </section>
+        <section id="admin-accounts-section" class="surface admin-tools-section" hidden>
+          <div class="section-heading"><div><p class="eyebrow">&#25480;&#27402;&#31649;&#29702;</p><h2>&#31649;&#29702;&#21729;&#24115;&#34399;</h2></div></div>
+          <form id="admin-create-account-form" class="admin-create-form">
+            <label for="new-admin-email">Email</label><input id="new-admin-email" name="email" type="email" autocomplete="email" required>
+            <label for="new-admin-role">&#35282;&#33394;</label><select id="new-admin-role" name="role"><option value="admin">&#27963;&#21205;&#31649;&#29702;&#21729;</option><option value="auditor">&#31245;&#26680;&#20154;&#21729;</option><option value="owner">&#31995;&#32113;&#31649;&#29702;&#21729;</option></select>
+            <button class="button button-primary" type="submit">&#26032;&#22686;&#31649;&#29702;&#21729;</button>
+          </form>
+          <p id="admin-accounts-message" class="notice" role="status" aria-live="polite"></p>
+          <div id="admin-accounts-list" class="admin-record-list"></div>
+        </section>
+        <section id="admin-audit-section" class="surface admin-tools-section" hidden>
+          <div class="section-heading"><div><p class="eyebrow">&#21487;&#36861;&#28335;&#30340;&#31649;&#29702;&#25805;&#20316;</p><h2>&#31245;&#26680;&#32000;&#37636;</h2></div><button id="refresh-admin-audit" class="icon-button" type="button" aria-label="&#37325;&#26032;&#25972;&#29702;&#31245;&#26680;&#32000;&#37636;">&#8635;</button></div>
+          <p id="admin-audit-message" class="notice" role="status" aria-live="polite"></p>
+          <div id="admin-audit-list" class="admin-record-list"></div>
+        </section>
+        <section id="admin-anomalies-section" class="surface admin-tools-section" hidden>
+          <div class="section-heading"><div><p class="eyebrow">&#20154;&#24037;&#35206;&#26680;</p><h2>&#30064;&#24120;&#35338;&#34399;</h2></div><button id="refresh-admin-anomalies" class="icon-button" type="button" aria-label="&#37325;&#26032;&#25972;&#29702;&#30064;&#24120;&#35338;&#34399;">&#8635;</button></div>
+          <p id="admin-anomalies-message" class="notice" role="status" aria-live="polite"></p>
+          <div id="admin-anomalies-list" class="admin-record-list"></div>
+        </section>
+        <section id="admin-progress-resets-section" class="surface admin-tools-section" hidden>
+          <div class="section-heading">
+            <div><p class="eyebrow">&#38617;&#20154;&#30906;&#35469;&#19982;&#36996;&#21407;</p><h2>&#29609;&#23478;&#36914;&#24230;&#37325;&#32622;</h2></div>
+            <label class="admin-reset-filter-label" for="admin-progress-reset-filter">&#30003;&#35531;&#29376;&#24907;
+              <select id="admin-progress-reset-filter">
+                <option value="all">&#20840;&#37096;</option>
+                <option value="awaiting_confirmation">&#24453;&#31532;&#20108;&#20301;&#31649;&#29702;&#21729;&#30906;&#35469;</option>
+                <option value="completed">&#24050;&#23436;&#25104;&#65288;&#21547;&#21487;&#25110;&#19981;&#21487;&#36996;&#21407;&#65289;</option>
+                <option value="restored">&#24050;&#36996;&#21407;</option>
+              </select>
+            </label>
+          </div>
+          <form id="admin-reset-player-search-form" class="admin-reset-search">
+            <label for="admin-reset-game">&#36984;&#25799;&#36938;&#25138;</label>
+            <select id="admin-reset-game" name="gameId" required></select>
+            <label for="admin-reset-anonymous-code">&#29609;&#23478;&#21299;&#21517;&#20195;&#30908;</label>
+            <input id="admin-reset-anonymous-code" name="anonymousCode" type="search" minlength="3" maxlength="40" autocomplete="off" required>
+            <button class="button button-primary" type="submit">&#25628;&#23563;</button>
+          </form>
+          <p id="admin-reset-search-message" class="notice" role="status" aria-live="polite"></p>
+          <div id="admin-reset-player-results" class="admin-record-list"></div>
+          <div class="admin-reset-history-heading">
+            <h3>&#30003;&#35531;&#27511;&#31243;</h3>
+            <button id="refresh-admin-progress-resets" class="icon-button" type="button" aria-label="&#37325;&#26032;&#25972;&#29702;&#36914;&#24230;&#37325;&#32622;&#30003;&#35531;">&#8635;</button>
+          </div>
+          <p id="admin-progress-resets-message" class="notice" role="status" aria-live="polite"></p>
+          <div id="admin-progress-resets-list" class="admin-record-list"></div>
+        </section>
+        <p id="admin-error" class="form-error" role="alert" aria-live="polite"></p>
+      </section>
+    </main>
+
+    <dialog id="progress-reset-restore-dialog" class="dialog-card">
+      <form method="dialog" class="stack-form">
+        <p class="eyebrow">&#36996;&#21407;&#36914;&#24230;</p>
+        <h2>&#35531;&#30906;&#35469;&#36996;&#21407;</h2>
+        <p id="progress-reset-restore-summary" class="muted"></p>
+        <p class="inline-warning">&#21482;&#26377;&#35442;&#29609;&#23478;&#36996;&#27809;&#26377;&#26032;&#25628;&#38598;&#26178;&#65292;&#20282;&#26381;&#22120;&#25165;&#26371;&#36996;&#21407;&#25104;&#21151;&#12290;</p>
+        <div class="dialog-actions">
+          <button id="cancel-progress-reset-restore" class="button button-subtle" type="button">&#21462;&#28040;</button>
+          <button id="confirm-progress-reset-restore" class="button button-primary" type="button">&#30906;&#35469;&#36996;&#21407;</button>
+        </div>
+        <p id="progress-reset-restore-error" class="form-error" role="alert" aria-live="polite"></p>
+      </form>
+    </dialog>
+
+    <dialog id="treasure-dialog" class="dialog-card">
+      <form id="treasure-form" method="dialog" class="stack-form">
+        <p class="eyebrow">草稿寶藏</p><h2 id="treasure-dialog-title">新增寶藏</h2>
+        <label for="treasure-title">寶藏名稱</label><input id="treasure-title" maxlength="120" required>
+        <label for="treasure-description">探索線索</label><textarea id="treasure-description" rows="3" maxlength="2000"></textarea>
+        <div class="form-grid"><label for="treasure-latitude">精確緯度</label><input id="treasure-latitude" type="number" step="any" min="-90" max="90" required><label for="treasure-longitude">精確經度</label><input id="treasure-longitude" type="number" step="any" min="-180" max="180" required></div>
+        <div class="form-grid"><label for="treasure-fuzzy-latitude">熱區中心緯度</label><input id="treasure-fuzzy-latitude" type="number" step="any" min="-90" max="90" required><label for="treasure-fuzzy-longitude">熱區中心經度</label><input id="treasure-fuzzy-longitude" type="number" step="any" min="-180" max="180" required></div>
+        <label for="treasure-radius">模糊熱區半徑（20–1,000 公尺）</label><input id="treasure-radius" type="number" min="20" max="1000" step="1" value="100" required>
+        <label class="check-row"><input id="treasure-enabled" type="checkbox" checked> 啟用此寶藏</label>
+        <div class="dialog-actions"><button id="delete-treasure" class="button button-danger" type="button" hidden>刪除</button><button id="cancel-treasure" class="button button-subtle" type="button">取消</button><button id="save-treasure" class="button button-primary" type="submit">儲存寶藏</button></div>
+        <p id="treasure-form-error" class="form-error" role="alert" aria-live="polite"></p>
+      </form>
+    </dialog>
+
+    <div id="toast" class="toast" role="status" aria-live="polite"></div>
+    <footer class="page-footer">LBS 虛擬尋寶 <span>・</span> 讓探索從你身邊開始</footer>
+  </body>
+</html>

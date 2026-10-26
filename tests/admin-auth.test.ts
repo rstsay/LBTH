@@ -208,6 +208,19 @@ describe("管理員 Magic Link、TOTP 與角色授權", () => {
     expect(secondFactorResponse.status).toBe(200);
   });
 
+  it("exposes the current administrator role only to an authenticated session", async () => {
+    const anonymousResponse = await fetch(`${baseUrl}/admin/auth/me`);
+    expect(anonymousResponse.status).toBe(401);
+
+    const owner = await enrollOwner();
+    const identityResponse = await fetch(`${baseUrl}/admin/auth/me`, {
+      headers: { cookie: owner.cookie },
+    });
+
+    expect(identityResponse.status).toBe(200);
+    expect(await identityResponse.json()).toEqual({ admin: { role: "owner" } });
+  });
+
   it("manages administrator roles, revokes disabled sessions, and audits without personal data", async () => {
     const owner = await enrollOwner();
     const lastOwnerDemotion = await fetch(
@@ -292,10 +305,21 @@ describe("管理員 Magic Link、TOTP 與角色授權", () => {
       },
       body: JSON.stringify({}),
     });
+    const deniedPlayerLookup = await fetch(
+      `${baseUrl}/admin/games/players?gameId=game-id&anonymousCode=PLAYER`,
+      { headers: reviewerCookie ? { cookie: reviewerCookie } : {} },
+    );
+    const deniedProgressResetList = await fetch(
+      `${baseUrl}/admin/games/progress-resets`,
+      { headers: reviewerCookie ? { cookie: reviewerCookie } : {} },
+    );
     const allowedReview = await fetch(`${baseUrl}/admin/games/anomalies`, {
       headers: reviewerCookie ? { cookie: reviewerCookie } : {},
     });
     const allowedAuditRead = await fetch(`${baseUrl}/admin/audit-logs`, {
+      headers: reviewerCookie ? { cookie: reviewerCookie } : {},
+    });
+    const reviewerIdentity = await fetch(`${baseUrl}/admin/auth/me`, {
       headers: reviewerCookie ? { cookie: reviewerCookie } : {},
     });
 
@@ -331,8 +355,12 @@ describe("管理員 Magic Link、TOTP 與角色授權", () => {
 
     expect(deniedWrite.status).toBe(403);
     expect(deniedGameWrite.status).toBe(403);
+    expect(deniedPlayerLookup.status).toBe(403);
+    expect(deniedProgressResetList.status).toBe(403);
     expect(allowedReview.status).toBe(200);
     expect(allowedAuditRead.status).toBe(200);
+    expect(reviewerIdentity.status).toBe(200);
+    expect(await reviewerIdentity.json()).toEqual({ admin: { role: "auditor" } });
     expect(disableResponse.status).toBe(200);
     expect(disabledRequest.status).toBe(401);
     expect(auditRows.length).toBeGreaterThanOrEqual(2);
