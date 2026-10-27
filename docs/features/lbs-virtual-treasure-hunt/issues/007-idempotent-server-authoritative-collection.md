@@ -8,6 +8,8 @@
 
 ## 7. [#7](https://github.com/rstsay/LBTH/issues/7) 冪等搜集與伺服器權威進度
 
+**Status:** 已實作；聚焦測試 26 項通過
+
 **User Story**  
 身為玩家，我希望搜集結果即時保存且不因重複請求重複計分。
 
@@ -32,7 +34,15 @@ Labels: AFK, backend, persistence, idempotency, P0
 
 ## 驗收
 
-- [ ] 完成上方驗收條件；相關 API、權限與錯誤情境符合產品需求文件。
+- [x] 完成上方驗收條件；相關 API、權限與錯誤情境符合產品需求文件。
 
 **原始 GitHub issue：** [#7](https://github.com/rstsay/LBTH/issues/7)
+
+## Implementation log
+
+- Date: 2026-10-26
+- Tests added: 無；驗收既有搜集服務、API、跨裝置重試及排行榜測試。
+- Key decisions: 維持 SQLite 唯一鍵與 `BEGIN IMMEDIATE` 交易；搜集紀錄、該場進度及伺服器累計由資料庫計算與回傳。
+- Architectural friction found: 無
+- Follow-up work: #9 全站累計前三名與玩家進度
 

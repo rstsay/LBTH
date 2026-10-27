@@ -29,6 +29,7 @@
 - 啟動時及預設每 24 小時建立線上一致性備份；備份須通過 SQLite 完整性與外鍵檢查。還原前驗證備份，應用程式停止時以暫存檔驗證後取代資料庫，失敗不得覆蓋現有資料。
 
 **營運設定與還原**
+- Production 必須設定至少 32 位元組的 `AUTH_HANDOFF_ENCRYPTION_KEY`，加密資料庫中的短效登入交接憑證；所有服務實例須共用同一密鑰。
 - `BACKUP_DIRECTORY` 預設 `./backups`；`BACKUP_INTERVAL_MS` 預設 `86400000` 毫秒。
 - `TRUST_PROXY_HOPS` 預設 `0`；僅於部署於會覆寫 `X-Forwarded-For` 的可信 Proxy 後，依實際 Proxy hop 數設定。
 - 停止伺服器後執行 `npm run db:restore -- <backup-file>`；路徑由 `DATABASE_PATH` 指定，拒絕還原損毀備份或資料庫仍有 WAL/SHM 活動檔。

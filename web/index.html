@@ -46,9 +46,10 @@
           <form id="magic-link-form" class="stack-form">
             <label for="login-email">電子郵件</label>
             <input id="login-email" name="email" type="email" autocomplete="email" placeholder="name@example.com" maxlength="254" required>
+            <label class="check-row login-trust-row"><input id="trust-device-after-login" type="checkbox" checked> 之後信任此裝置繼續</label>
             <button id="magic-link-submit" class="button button-primary button-wide" type="submit">寄送登入連結</button>
           </form>
-          <button id="trusted-device-login" class="button button-primary button-wide" type="button" hidden>以此信任裝置繼續</button>
+          <button id="trusted-device-login" class="button button-primary button-wide" type="button" hidden>使用已信任裝置登入</button>
           <p id="auth-message" class="notice" role="status" aria-live="polite"></p>
           <p id="auth-error" class="form-error" role="alert" aria-live="polite"></p>
           <p class="fine-print">繼續使用即表示你同意以瀏覽器前景定位參與遊戲。</p>

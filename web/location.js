@@ -1,5 +1,14 @@
 const MINIMUM_REPORT_INTERVAL_MS = 5_000;
 
+export function toApiLocation(location) {
+  return {
+    ...location,
+    timestamp: Number.isSafeInteger(location.timestamp) && location.timestamp >= 0
+      ? location.timestamp
+      : Date.now(),
+  };
+}
+
 export class ForegroundLocationTracker {
   constructor({
     geolocation,
@@ -18,6 +27,7 @@ export class ForegroundLocationTracker {
     this.onError = onError;
     this.now = now;
     this.watchId = undefined;
+    this.watchGeneration = 0;
     this.started = false;
     this.lastReportedAt = undefined;
     this.onVisibilityChange = () => {
@@ -47,9 +57,14 @@ export class ForegroundLocationTracker {
 
   startWatching() {
     if (!this.started || this.watchId !== undefined || this.visibility.hidden) return;
+    const watchGeneration = ++this.watchGeneration;
     this.watchId = this.geolocation.watchPosition(
       (position) => {
-        if (!this.started || this.visibility.hidden) return;
+        if (
+          !this.started ||
+          this.visibility.hidden ||
+          watchGeneration !== this.watchGeneration
+        ) return;
         const { latitude, longitude, accuracy } = position.coords;
         if (
           !Number.isFinite(latitude) ||
@@ -75,7 +90,11 @@ export class ForegroundLocationTracker {
         }
       },
       (error) => {
-        if (this.started && !this.visibility.hidden) this.onError?.(error);
+        if (
+          this.started &&
+          !this.visibility.hidden &&
+          watchGeneration === this.watchGeneration
+        ) this.onError?.(error);
       },
       { enableHighAccuracy: true, maximumAge: 0, timeout: 20_000 },
     );
@@ -85,5 +104,6 @@ export class ForegroundLocationTracker {
     if (this.watchId === undefined) return;
     this.geolocation.clearWatch(this.watchId);
     this.watchId = undefined;
+    this.watchGeneration += 1;
   }
 }

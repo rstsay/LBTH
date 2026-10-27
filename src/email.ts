@@ -32,8 +32,8 @@ export class SmtpMagicLinkSender implements MagicLinkSender {
       from: this.from,
       to: email,
       subject: "LBS 虛擬尋寶登入連結",
-      text: `請在 15 分鐘內，使用開始登入的瀏覽器開啟以下連結並確認：\n${url}\n\n玩家首次使用或更換裝置時需要 Email 確認；管理員仍須完成 TOTP。若你沒有要求登入，請忽略此信。`,
-      html: `<p>請在 15 分鐘內，使用開始登入的瀏覽器開啟以下連結並確認：</p><p><a href="${escapeHtml(url)}">確認登入</a></p><p>玩家首次使用或更換裝置時需要 Email 確認；管理員仍須完成 TOTP。若你沒有要求登入，請忽略此信。</p>`,
+      text: `請在 3 分鐘內點擊以下連結核准登入。登入會在開始申請的裝置完成：\n${url}\n\n若你沒有要求登入，請忽略此信。`,
+      html: `<p>請在 3 分鐘內點擊以下連結核准登入。登入會在開始申請的裝置完成。</p><p><a href="${escapeHtml(url)}">核准登入</a></p><p>若你沒有要求登入，請忽略此信。</p>`,
     });
   }
 }

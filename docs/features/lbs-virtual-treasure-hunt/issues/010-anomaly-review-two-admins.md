@@ -2,6 +2,7 @@
 **PRD version:** v2.2  
 **Source requirement:** 異常訊號與雙人覆核 — 8.2 異常門檻與處理、10. 管理員需求與審計  
 **Iteration:** 1  
+**Status:** 程式端已實作；聚焦測試 7 項通過；整體驗收待完成<br>
 **Type:** HITL  
 **Depends on:** #6、#7、#11  
 **Part of:** [LBS 虛擬尋寶 PWA](../02-prd.md)
@@ -38,4 +39,17 @@ Labels: HITL, admin, audit, anti-abuse, P1
 - [ ] 完成上方驗收條件；相關 API、權限與錯誤情境符合產品需求文件。
 
 **原始 GitHub issue：** [#10](https://github.com/rstsay/LBTH/issues/10)
+
+## 實作紀錄
+
+- 日期：2026-10-26
+- 靜態檢視確認：位置異常偵測、管理員異常查詢與雙人覆核 API 已存在；管理介面由本地 issue [#15](./015-anomaly-review-workflow-ui.md) 追蹤，相關進度重置介面由 [#16](./016-progress-reset-workflow-ui.md) 追蹤。
+- 測試：執行 `npm test -- tests/anomalies.test.ts`，7 項測試全數通過。
+- 驗收：尚未完成整體操作驗收；保留待完成狀態。
+
+## 修訂紀錄
+
+| 日期 | PRD 版本 | 修訂內容 | 原因 |
+|---|---|---|---|
+| 2026-10-26 | v2.2 | 補上實作狀態並連結相關介面 issue | 讓 issue 追蹤符合既有 API 與介面實作 |
 

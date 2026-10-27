@@ -2,9 +2,10 @@
   COLLECTION_THRESHOLD_METERS,
   distanceMeters,
 } from "/app/geo.js";
-import { ForegroundLocationTracker } from "/app/location.js";
+import { ForegroundLocationTracker, toApiLocation } from "/app/location.js";
 import { adminCapabilities as getAdminCapabilities } from "/app/admin-access.js";
 import { activityTimeToIso } from "/app/time.js";
+import { waitForAuthHandoff } from "/app/auth-handoff.js";
 
 const state = {
   role: "",
@@ -42,6 +43,10 @@ let playerVerificationRefresh;
 const playerAuthChannel = "BroadcastChannel" in window
   ? new BroadcastChannel("lbs-player-auth")
   : null;
+let adminVerificationRefresh;
+const adminAuthChannel = "BroadcastChannel" in window
+  ? new BroadcastChannel("lbs-admin-auth")
+  : null;
 
 async function refreshPlayerAfterEmailVerification() {
   if (playerVerificationRefresh) return playerVerificationRefresh;
@@ -63,9 +68,32 @@ playerAuthChannel?.addEventListener("message", (event) => {
     void refreshPlayerAfterEmailVerification();
   }
 });
+async function refreshAdminAfterEmailVerification() {
+  if (adminVerificationRefresh) return adminVerificationRefresh;
+  adminVerificationRefresh = (async () => {
+    try {
+      await loadAdminWorkspace();
+      announce("Email 已確認，已返回管理工作區。");
+    } catch {
+      // 不同瀏覽器設定檔不共用登入 Cookie；確認頁會在自己的頁面開啟工作區。
+    }
+  })().finally(() => {
+    adminVerificationRefresh = null;
+  });
+  return adminVerificationRefresh;
+}
+
+adminAuthChannel?.addEventListener("message", (event) => {
+  if (event.data?.type === "admin-authenticated") {
+    void refreshAdminAfterEmailVerification();
+  }
+});
 window.addEventListener("storage", (event) => {
   if (event.key === "lbs-player-authenticated") {
     void refreshPlayerAfterEmailVerification();
+  }
+  if (event.key === "lbs-admin-authenticated") {
+    void refreshAdminAfterEmailVerification();
   }
 });
 
@@ -108,10 +136,12 @@ async function api(path, options = {}) {
     throw new Error(message || "伺服器回傳無法辨識的回應。");
   }
   const body = await response.json();
+  const requestToken = response.headers.get("X-Auth-Request-Token");
+  if (requestToken) body.requestToken = requestToken;
   if (!response.ok) {
     const error = new Error(body.message || body.error || "服務暫時無法完成要求。");
     error.status = response.status;
-    error.code = body.error;
+    error.code = body.code || body.error;
     error.details = body;
     throw error;
   }
@@ -186,7 +216,7 @@ function setLoginRole(role) {
   $("#magic-link-submit").dataset.originalLabel = $("#magic-link-submit").textContent;
   $("#trusted-device-login").textContent = role === "admin"
     ? "以信任的管理員裝置登入"
-    : "以此信任裝置繼續";
+    : "使用已信任裝置登入";
   $("#trusted-device-login").hidden = role !== "admin";
   $("#auth-message").textContent = "";
   showLoginError();
@@ -223,7 +253,10 @@ async function submitMagicLink(event) {
       : "/auth/magic-links";
     const result = await api(endpoint, {
       method: "POST",
-      body: jsonBody({ email }),
+      body: jsonBody({
+        email,
+        trustDevice: $("#trust-device-after-login").checked,
+      }),
     });
     if (result.trustedDevice) {
       if (state.loginRole === "admin") {
@@ -235,11 +268,35 @@ async function submitMagicLink(event) {
       }
       return;
     }
+    if (result.requestToken) {
+      const expiresAt = Date.now() + 3 * 60 * 1000;
+      $("#auth-message").textContent = "請在 3 分鐘內確認 Email 中的登入連結；確認後本頁會自動登入。";
+      await waitForAuthHandoff({
+        api,
+        requestToken: result.requestToken,
+        expiresAt,
+        enterMode: async (role) => {
+          if (role === "admin") await loadAdminWorkspace();
+          else await loadPlayerHome();
+        },
+        onRetry: () => {
+          $("#auth-message").textContent = "登入頁正在重新連線，請保持此頁開啟；核准後會自動進入遊戲。";
+        },
+      });
+      return;
+    }
     $("#auth-message").textContent = state.loginRole === "admin"
       ? result.message
       : `${result.message} 首次使用或更換裝置時才需要確認；請在此瀏覽器開啟信中的連結，原頁會自動繼續。`;
   } catch (error) {
-    showLoginError(error.message);
+    if (error.code === "AUTH_HANDOFF_EXPIRED") {
+      showLoginError();
+      $("#auth-message").textContent = "已逾時，請確認 Email 地址是否正確。";
+    } else if (error.code === "PLAYER_SESSION_ACTIVE") {
+      showLoginError(error.message);
+    } else {
+      showLoginError(error.message);
+    }
   } finally {
     setBusy(button, false);
   }
@@ -515,13 +572,6 @@ function startLocationTracking() {
     },
   });
   state.locationTracker.start();
-}
-
-function toApiLocation(location) {
-  return {
-    ...location,
-    timestamp: new Date(location.timestamp || Date.now()).toISOString(),
-  };
 }
 
 function onPosition(location) {
@@ -1957,7 +2007,17 @@ async function logout() {
   try {
     await api(state.role === "admin" ? "/admin/auth/logout" : "/auth/logout", { method: "POST" });
   } catch (error) {
-    if (error.status !== 401) announce(error.message);
+    if (error.status !== 401) {
+      if (wasPlayer) {
+        try {
+          await loadPlayerHome();
+        } catch {
+          // 登出失敗時保留目前登入狀態，避免誤導玩家以為登入鎖已解除。
+        }
+      }
+      announce(`登出失敗，仍保持登入：${error.message}`);
+      return;
+    }
   }
   state.role = "";
   state.game = null;

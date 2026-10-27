@@ -40,6 +40,7 @@ import {
 } from "./games.ts";
 
 const MAGIC_LINK_TTL_MS = 15 * 60 * 1000;
+const AUTH_HANDOFF_TTL_MS = 3 * 60 * 1000;
 const SESSION_COOKIE_NAME = "player_session";
 const TRUSTED_DEVICE_COOKIE_NAME = "player_trusted_device";
 const TRUSTED_DEVICE_COOKIE_MAX_AGE_SECONDS = 10 * 365 * 24 * 60 * 60;
@@ -66,6 +67,7 @@ export interface AuthAppOptions {
   getAdminActorId?: (request: Request) => string | undefined;
   adminBootstrapEmail?: string;
   adminTotpEncryptionKey?: string;
+  authHandoffEncryptionKey?: string;
   trustProxyHops?: number;
 }
 
@@ -114,6 +116,22 @@ export function initializeAuthSchema(database: DatabaseSync): void {
       created_at INTEGER NOT NULL,
       expires_at INTEGER NOT NULL,
       consumed_at INTEGER
+    );
+
+    CREATE TABLE IF NOT EXISTS auth_handoffs (
+      token_hash TEXT PRIMARY KEY,
+      request_id TEXT NOT NULL UNIQUE,
+      role TEXT NOT NULL CHECK(role IN ('player', 'admin')),
+      account_key TEXT NOT NULL,
+      trust_device INTEGER NOT NULL DEFAULT 1 CHECK(trust_device IN (0, 1)),
+      created_at INTEGER NOT NULL,
+      expires_at INTEGER NOT NULL,
+      approved_at INTEGER,
+      denied_at INTEGER,
+      denial_code TEXT,
+      session_token TEXT,
+      trusted_token TEXT,
+      completed_at INTEGER
     );
 
     CREATE INDEX IF NOT EXISTS magic_links_email_idx
@@ -204,6 +222,27 @@ export function initializeAuthSchema(database: DatabaseSync): void {
     CREATE INDEX IF NOT EXISTS admin_audit_log_created_at_idx
       ON admin_audit_log(created_at);
   `);
+  const handoffColumns = database
+    .prepare("PRAGMA table_info(auth_handoffs)")
+    .all() as Array<{ name: string }>;
+  if (!handoffColumns.some((column) => column.name === "request_id")) {
+    database.exec("ALTER TABLE auth_handoffs ADD COLUMN request_id TEXT");
+    database.exec(
+      "UPDATE auth_handoffs SET request_id = lower(hex(randomblob(16))) WHERE request_id IS NULL",
+    );
+    database.exec(
+      "CREATE UNIQUE INDEX IF NOT EXISTS auth_handoffs_request_id_idx ON auth_handoffs(request_id)",
+    );
+  }
+  if (!handoffColumns.some((column) => column.name === "trust_device")) {
+    database.exec("ALTER TABLE auth_handoffs ADD COLUMN trust_device INTEGER NOT NULL DEFAULT 1 CHECK(trust_device IN (0, 1))");
+  }
+  if (!handoffColumns.some((column) => column.name === "denied_at")) {
+    database.exec("ALTER TABLE auth_handoffs ADD COLUMN denied_at INTEGER");
+  }
+  if (!handoffColumns.some((column) => column.name === "denial_code")) {
+    database.exec("ALTER TABLE auth_handoffs ADD COLUMN denial_code TEXT");
+  }
   database.exec(`
     CREATE TRIGGER IF NOT EXISTS admin_audit_log_immutable_update
     BEFORE UPDATE ON admin_audit_log
@@ -329,6 +368,15 @@ function setAdminTrustedDeviceCookie(
   response.append("Set-Cookie", attributes.join("; "));
 }
 
+function clearAdminTrustedDeviceCookie(response: Response, secure: boolean): void {
+  response.append(
+    "Set-Cookie",
+    `${ADMIN_TRUSTED_DEVICE_COOKIE_NAME}=; Path=/admin; HttpOnly; SameSite=Strict; Max-Age=0${
+      secure ? "; Secure" : ""
+    }`,
+  );
+}
+
 function readCookie(request: Request, name: string): string | undefined {
   const cookieHeader = request.header("cookie");
   if (!cookieHeader) {
@@ -445,6 +493,26 @@ function decryptTotpSecret(encrypted: string, encryptionKey: string): string {
   ]).toString("utf8");
 }
 
+function encryptHandoffValue(value: string, encryptionKey: string): string {
+  const key = createHash("sha256").update(encryptionKey).digest();
+  const iv = randomBytes(12);
+  const cipher = createCipheriv("aes-256-gcm", key, iv);
+  const ciphertext = Buffer.concat([cipher.update(value, "utf8"), cipher.final()]);
+  return [iv, cipher.getAuthTag(), ciphertext].map((part) => part.toString("base64url")).join(".");
+}
+
+function decryptHandoffValue(encrypted: string, encryptionKey: string): string {
+  const [ivValue, tagValue, ciphertextValue] = encrypted.split(".");
+  if (!ivValue || !tagValue || !ciphertextValue) throw new Error("Stored auth handoff is invalid");
+  const key = createHash("sha256").update(encryptionKey).digest();
+  const decipher = createDecipheriv("aes-256-gcm", key, Buffer.from(ivValue, "base64url"));
+  decipher.setAuthTag(Buffer.from(tagValue, "base64url"));
+  return Buffer.concat([
+    decipher.update(Buffer.from(ciphertextValue, "base64url")),
+    decipher.final(),
+  ]).toString("utf8");
+}
+
 function adminSessionToken(request: Request): string | undefined {
   return readCookie(request, ADMIN_SESSION_COOKIE_NAME);
 }
@@ -527,6 +595,12 @@ export function createAuthApp(options: AuthAppOptions): Express {
   app.set("trust proxy", options.trustProxyHops ?? 0);
   const now = options.now ?? Date.now;
   const createToken = options.createToken ?? (() => randomBytes(32).toString("base64url"));
+  const authHandoffEncryptionKey = options.authHandoffEncryptionKey
+    ?? process.env.AUTH_HANDOFF_ENCRYPTION_KEY
+    ?? (process.env.NODE_ENV === "production" ? undefined : randomBytes(32).toString("base64url"));
+  if (!authHandoffEncryptionKey || Buffer.byteLength(authHandoffEncryptionKey, "utf8") < 32) {
+    throw new Error("AUTH_HANDOFF_ENCRYPTION_KEY must be at least 32 bytes");
+  }
   const createId = options.createId ?? randomUUID;
   const secureCookies = options.secureCookies ?? process.env.NODE_ENV === "production";
   const publicAppUrl = new URL(options.publicAppUrl);
@@ -630,7 +704,7 @@ export function createAuthApp(options: AuthAppOptions): Express {
     adminId: string,
     response: Response,
     timestamp: number,
-  ): void => {
+  ): string => {
     const token = createToken();
     options.database
       .prepare(
@@ -655,6 +729,7 @@ export function createAuthApp(options: AuthAppOptions): Express {
       attributes.push("Secure");
     }
     response.append("Set-Cookie", attributes.join("; "));
+    return token;
   };
   const auditAdminRequest = (
     request: Request,
@@ -842,7 +917,17 @@ export function createAuthApp(options: AuthAppOptions): Express {
         `window.LBS_CONFIG = Object.freeze({ googleMapsApiKey: ${JSON.stringify(options.googleMapsApiKey ?? "")} });`,
       );
   });
-  app.use("/app", express.static(webDirectory, { index: "index.html" }));
+  app.use(
+    "/app",
+    express.static(webDirectory, {
+      index: "index.html",
+      setHeaders: (response, filePath) => {
+        if (/\.(?:html|js)$/.test(filePath)) {
+          response.setHeader("Cache-Control", "no-store");
+        }
+      },
+    }),
+  );
   app.get("/", (_request, response) => {
     response.type("html").send(`<!doctype html>
 <html lang="zh-Hant">
@@ -889,6 +974,9 @@ export function createAuthApp(options: AuthAppOptions): Express {
         return;
       }
       const email = normalizeEmail(request.body.email);
+      const trustDevice = typeof request.body.trustDevice === "boolean"
+        ? request.body.trustDevice
+        : true;
       if (!validator.isEmail(email)) {
         response.status(400).json({ error: "請提供有效的 Email。" });
         return;
@@ -896,6 +984,7 @@ export function createAuthApp(options: AuthAppOptions): Express {
       const admin = options.database
         .prepare("SELECT id FROM administrators WHERE email = ? AND active = 1")
         .get(email) as { id: string } | undefined;
+      let requestToken: string | undefined;
       if (admin) {
         const trustedDeviceToken = readCookie(
           request,
@@ -921,6 +1010,16 @@ export function createAuthApp(options: AuthAppOptions): Express {
         const token = createToken();
         const tokenHash = hashToken(token);
         const timestamp = now();
+        requestToken = randomBytes(32).toString("base64url");
+        const requestId = randomBytes(16).toString("hex");
+        options.database.prepare("DELETE FROM auth_handoffs WHERE expires_at <= ?").run(timestamp);
+        options.database
+          .prepare(
+            `INSERT INTO auth_handoffs (
+              token_hash, request_id, role, account_key, trust_device, created_at, expires_at
+            ) VALUES (?, ?, 'admin', ?, ?, ?, ?)`,
+          )
+          .run(hashToken(requestToken), requestId, admin.id, Number(trustDevice), timestamp, timestamp + AUTH_HANDOFF_TTL_MS);
         options.database
           .prepare(
             `INSERT INTO admin_magic_links (
@@ -935,24 +1034,31 @@ export function createAuthApp(options: AuthAppOptions): Express {
           );
         const verificationUrl = new URL("/admin/auth/verify", publicAppUrl);
         verificationUrl.searchParams.set("token", token);
+        verificationUrl.searchParams.set("requestId", requestId);
         try {
           await options.mailer.send(email, verificationUrl.toString());
         } catch (error) {
           options.database
             .prepare("DELETE FROM admin_magic_links WHERE token_hash = ?")
             .run(tokenHash);
+          options.database
+            .prepare("DELETE FROM auth_handoffs WHERE token_hash = ?")
+            .run(hashToken(requestToken));
           next(new EmailDeliveryError(error));
           return;
         }
       }
+      if (requestToken) response.setHeader("X-Auth-Request-Token", requestToken);
       response.status(202).json({
         message: "若管理員帳號有效，系統將寄送首次裝置確認連結。",
+        ...(admin ? { requestToken } : {}),
       });
     },
   );
 
   app.get("/admin/auth/verify", (request: Request, response: Response) => {
     const token = request.query.token;
+    const requestId = typeof request.query.requestId === "string" ? request.query.requestId : "";
     if (typeof token !== "string" || token.length === 0) {
       response.status(400).type("text/plain").send("登入連結無效或已過期。");
       return;
@@ -982,9 +1088,11 @@ export function createAuthApp(options: AuthAppOptions): Express {
       <p class="eyebrow">管理員登入</p>
       <h1>確認 Email</h1>
       <p class="muted">首次在此裝置確認後，即可登入管理工作區。</p>
-      <form data-verification="admin">
+      <p class="muted" data-verification-status>正在核准登入，請稍候…</p>
+      <form data-verification="admin" hidden>
         <input type="hidden" name="token" value="${escapeHtml(token)}">
-        <button class="button button-primary" type="submit">確認並繼續</button>
+        <input type="hidden" name="requestId" value="${escapeHtml(requestId)}">
+        <button class="button button-primary" type="submit">核准原裝置登入</button>
       </form>
       <p class="form-error" role="alert" aria-live="polite"></p>
     </main>
@@ -994,7 +1102,7 @@ export function createAuthApp(options: AuthAppOptions): Express {
   });
 
   app.post("/admin/auth/verify", (request: Request, response: Response) => {
-    if (!isRecord(request.body) || typeof request.body.token !== "string") {
+    if (!isRecord(request.body) || typeof request.body.token !== "string" || typeof request.body.requestId !== "string") {
       response.status(400).json({ error: "登入連結無效或已過期。" });
       return;
     }
@@ -1025,27 +1133,56 @@ export function createAuthApp(options: AuthAppOptions): Express {
         response.status(410).json({ error: "登入連結無效或已過期。" });
         return;
       }
+      const handoffHash = options.database.prepare(
+        "SELECT token_hash FROM auth_handoffs WHERE request_id = ?",
+      ).get(request.body.requestId) as { token_hash: string } | undefined;
+      if (!handoffHash) {
+        options.database.exec("ROLLBACK");
+        response.status(410).json({ error: "登入要求已失效，請重新申請。" });
+        return;
+      }
+      const handoff = options.database.prepare(
+        `SELECT trust_device FROM auth_handoffs WHERE request_id = ? AND role = 'admin'
+         AND account_key = ? AND expires_at > ? AND approved_at IS NULL AND denied_at IS NULL`,
+      ).get(request.body.requestId, magicLink.admin_id, timestamp) as { trust_device: number } | undefined;
+      if (!handoff) {
+        options.database.exec("ROLLBACK");
+        response.status(410).json({ error: "登入要求已失效，請重新申請。" });
+        return;
+      }
       options.database
         .prepare(
           `UPDATE admin_magic_links SET consumed_at = ?
            WHERE token_hash = ? AND consumed_at IS NULL`,
         )
         .run(timestamp, tokenHash);
-      const trustedDeviceToken = createToken();
-      options.database
-        .prepare(
-          `INSERT INTO admin_trusted_devices (
-            token_hash, admin_id, created_at, last_seen_at, revoked_at
-          ) VALUES (?, ?, ?, ?, NULL)`,
-        )
-        .run(
-          hashToken(trustedDeviceToken),
-          magicLink.admin_id,
-          timestamp,
-          timestamp,
-        );
-      issueAdminSession(magicLink.admin_id, response, timestamp);
-      setAdminTrustedDeviceCookie(response, trustedDeviceToken, secureCookies);
+      const trustedDeviceToken = handoff.trust_device ? createToken() : null;
+      if (trustedDeviceToken) {
+        options.database
+          .prepare(
+            `INSERT INTO admin_trusted_devices (
+              token_hash, admin_id, created_at, last_seen_at, revoked_at
+            ) VALUES (?, ?, ?, ?, NULL)`,
+          )
+          .run(
+            hashToken(trustedDeviceToken),
+            magicLink.admin_id,
+            timestamp,
+            timestamp,
+          );
+      }
+      const adminSessionToken = issueAdminSession(magicLink.admin_id, response, timestamp);
+      if (trustedDeviceToken) setAdminTrustedDeviceCookie(response, trustedDeviceToken, secureCookies);
+      else clearAdminTrustedDeviceCookie(response, secureCookies);
+      options.database.prepare(
+        `UPDATE auth_handoffs SET approved_at = ?, session_token = ?, trusted_token = ?
+         WHERE token_hash = ?`,
+      ).run(
+        timestamp,
+        encryptHandoffValue(adminSessionToken, authHandoffEncryptionKey),
+        trustedDeviceToken ? encryptHandoffValue(trustedDeviceToken, authHandoffEncryptionKey) : null,
+        handoffHash.token_hash,
+      );
       options.database
         .prepare(
           `INSERT INTO admin_audit_log (
@@ -1057,10 +1194,11 @@ export function createAuthApp(options: AuthAppOptions): Express {
           createId(),
           magicLink.admin_id,
           magicLink.admin_id,
-          JSON.stringify({ method: "email_magic_link", deviceTrusted: true }),
+          JSON.stringify({ method: "email_magic_link", deviceTrusted: Boolean(trustedDeviceToken) }),
           timestamp,
         );
       options.database.exec("COMMIT");
+      response.removeHeader("Set-Cookie");
       response.setHeader("Cache-Control", "no-store");
       response.json({ authenticated: true });
     } catch (error) {
@@ -1363,6 +1501,9 @@ export function createAuthApp(options: AuthAppOptions): Express {
       }
 
       const email = normalizeEmail(request.body.email);
+      const trustDevice = typeof request.body.trustDevice === "boolean"
+        ? request.body.trustDevice
+        : true;
       if (!validator.isEmail(email)) {
         response.status(400).json({ error: "請提供有效的 Email。" });
         return;
@@ -1393,6 +1534,15 @@ export function createAuthApp(options: AuthAppOptions): Express {
       const tokenHash = hashToken(token);
       const timestamp = now();
       const expiresAt = timestamp + MAGIC_LINK_TTL_MS;
+      const requestToken = randomBytes(32).toString("base64url");
+      const requestId = randomBytes(16).toString("hex");
+      options.database.prepare("DELETE FROM auth_handoffs WHERE expires_at <= ?").run(timestamp);
+      options.database
+        .prepare(`INSERT INTO auth_handoffs (
+          token_hash, request_id, role, account_key, trust_device, created_at, expires_at
+        ) VALUES (?, ?, 'player', ?, ?, ?, ?)`)
+        .run(hashToken(requestToken), requestId, email, Number(trustDevice), timestamp, timestamp + AUTH_HANDOFF_TTL_MS);
+      response.setHeader("X-Auth-Request-Token", requestToken);
       options.database
         .prepare(
           `INSERT INTO magic_links (token_hash, email, created_at, expires_at, consumed_at)
@@ -1402,6 +1552,7 @@ export function createAuthApp(options: AuthAppOptions): Express {
 
       const verificationUrl = new URL("/auth/verify", publicAppUrl);
       verificationUrl.searchParams.set("token", token);
+      verificationUrl.searchParams.set("requestId", requestId);
 
       try {
         await options.mailer.send(email, verificationUrl.toString());
@@ -1409,11 +1560,15 @@ export function createAuthApp(options: AuthAppOptions): Express {
         options.database
           .prepare("DELETE FROM magic_links WHERE token_hash = ?")
           .run(tokenHash);
+        options.database
+          .prepare("DELETE FROM auth_handoffs WHERE token_hash = ?")
+          .run(hashToken(requestToken));
         next(new EmailDeliveryError(error));
         return;
       }
 
       response.status(202).json({
+        requestToken,
         message: "若此 Email 可用，系統將寄送一次性登入連結。",
       });
     },
@@ -1421,6 +1576,7 @@ export function createAuthApp(options: AuthAppOptions): Express {
 
   app.get("/auth/verify", (request: Request, response: Response) => {
     const token = request.query.token;
+    const requestId = typeof request.query.requestId === "string" ? request.query.requestId : "";
     if (typeof token !== "string" || token.length === 0) {
       response.status(400).type("text/plain").send("登入連結無效或已過期。");
       return;
@@ -1451,9 +1607,11 @@ export function createAuthApp(options: AuthAppOptions): Express {
       <p class="eyebrow">玩家登入</p>
       <h1>確認登入</h1>
       <p class="muted">按下按鈕完成 Email 驗證並返回尋寶地圖。</p>
-      <form data-verification="player">
+      <p class="muted" data-verification-status>正在核准登入，請稍候…</p>
+      <form data-verification="player" hidden>
         <input type="hidden" name="token" value="${escapeHtml(token)}">
-        <button class="button button-primary" type="submit">確認登入</button>
+        <input type="hidden" name="requestId" value="${escapeHtml(requestId)}">
+        <button class="button button-primary" type="submit">核准原裝置登入</button>
       </form>
       <p class="form-error" role="alert" aria-live="polite"></p>
     </main>
@@ -1463,7 +1621,7 @@ export function createAuthApp(options: AuthAppOptions): Express {
   });
 
   app.post("/auth/verify", (request: Request, response: Response) => {
-    if (!isRecord(request.body) || typeof request.body.token !== "string") {
+    if (!isRecord(request.body) || typeof request.body.token !== "string" || typeof request.body.requestId !== "string") {
       response.status(400).json({ error: "登入連結無效或已過期。" });
       return;
     }
@@ -1486,10 +1644,45 @@ export function createAuthApp(options: AuthAppOptions): Express {
         return;
       }
 
+      const handoffHash = options.database.prepare(
+        "SELECT token_hash FROM auth_handoffs WHERE request_id = ?",
+      ).get(request.body.requestId) as { token_hash: string } | undefined;
+      if (!handoffHash) {
+        options.database.exec("ROLLBACK");
+        response.status(410).json({ error: "登入要求已失效，請重新申請。" });
+        return;
+      }
+      const handoff = options.database.prepare(
+        `SELECT trust_device FROM auth_handoffs WHERE request_id = ? AND role = 'player'
+         AND account_key = ? AND expires_at > ? AND approved_at IS NULL AND denied_at IS NULL`,
+      ).get(request.body.requestId, magicLink.email, timestamp) as { trust_device: number } | undefined;
+      if (!handoff) {
+        options.database.exec("ROLLBACK");
+        response.status(410).json({ error: "登入要求已失效，請重新申請。" });
+        return;
+      }
+
       const existingPlayer = options.database
         .prepare("SELECT id FROM players WHERE email = ?")
         .get(magicLink.email) as { id: string } | undefined;
       if (existingPlayer) {
+        const activeSession = options.database
+          .prepare("SELECT 1 FROM player_sessions WHERE player_id = ? AND revoked_at IS NULL")
+          .get(existingPlayer.id);
+        if (activeSession) {
+          options.database
+            .prepare("UPDATE magic_links SET consumed_at = ? WHERE token_hash = ? AND consumed_at IS NULL")
+            .run(timestamp, tokenHash);
+          options.database
+            .prepare("UPDATE auth_handoffs SET denied_at = ?, denial_code = 'PLAYER_SESSION_ACTIVE' WHERE token_hash = ?")
+            .run(timestamp, handoffHash.token_hash);
+          options.database.exec("COMMIT");
+          response.status(409).json({
+            code: "PLAYER_SESSION_ACTIVE",
+            error: "此帳號已在其他裝置登入；請先在該裝置登出後再試。",
+          });
+          return;
+        }
         const activeGame = options.database
           .prepare(
             `SELECT game_id, device_token_hash,
@@ -1543,43 +1736,112 @@ export function createAuthApp(options: AuthAppOptions): Express {
 
       const player = createPlayer(options.database, magicLink.email, timestamp, createId);
       const sessionToken = createToken();
-      const trustedDeviceToken = createToken();
-      options.database
-        .prepare(
-          "UPDATE player_sessions SET revoked_at = ? WHERE player_id = ? AND revoked_at IS NULL",
-        )
-        .run(timestamp, player.id);
+      const trustedDeviceToken = handoff.trust_device ? createToken() : null;
+      const deviceTokenHash = trustedDeviceToken
+        ? hashToken(trustedDeviceToken)
+        : hashToken(sessionToken);
       options.database
         .prepare(
           `INSERT INTO player_sessions (
             token_hash, player_id, device_token_hash, created_at, revoked_at
           ) VALUES (?, ?, ?, ?, NULL)`,
         )
-        .run(hashToken(sessionToken), player.id, hashToken(trustedDeviceToken), timestamp);
-      options.database
-        .prepare(
-          `INSERT INTO player_trusted_devices (
-            token_hash, player_id, created_at, last_seen_at, revoked_at
-          ) VALUES (?, ?, ?, ?, NULL)`,
-        )
-        .run(hashToken(trustedDeviceToken), player.id, timestamp, timestamp);
+        .run(hashToken(sessionToken), player.id, deviceTokenHash, timestamp);
+      if (trustedDeviceToken) {
+        options.database
+          .prepare(
+            `INSERT INTO player_trusted_devices (
+              token_hash, player_id, created_at, last_seen_at, revoked_at
+            ) VALUES (?, ?, ?, ?, NULL)`,
+          )
+          .run(deviceTokenHash, player.id, timestamp, timestamp);
+      }
+
+      options.database.prepare(
+        `UPDATE auth_handoffs SET approved_at = ?, session_token = ?, trusted_token = ?
+         WHERE token_hash = ?`,
+      ).run(
+        timestamp,
+        encryptHandoffValue(sessionToken, authHandoffEncryptionKey),
+        trustedDeviceToken ? encryptHandoffValue(trustedDeviceToken, authHandoffEncryptionKey) : null,
+        handoffHash.token_hash,
+      );
 
       options.database.exec("COMMIT");
-      setSessionCookie(response, sessionToken, secureCookies);
-      setTrustedDeviceCookie(response, trustedDeviceToken, secureCookies);
       response.setHeader("Cache-Control", "no-store");
-      response.status(200).json({
-        player: {
-          id: player.id,
-          anonymousCode: player.anonymous_code,
-          email: player.email,
-          emailVerified: true,
-        },
-      });
+      response.status(200).json({ approved: true });
     } catch (error) {
       options.database.exec("ROLLBACK");
       throw error;
     }
+  });
+
+  app.post("/auth/complete", (request: Request, response: Response) => {
+    response.setHeader("Cache-Control", "no-store");
+    if (!isRecord(request.body) || typeof request.body.requestToken !== "string") {
+      response.status(400).json({ error: "登入要求無效。" });
+      return;
+    }
+    const handoff = options.database.prepare(
+      `SELECT role, account_key, trust_device, expires_at, approved_at, denied_at, denial_code,
+              session_token, trusted_token
+       FROM auth_handoffs WHERE token_hash = ?`,
+    ).get(hashToken(request.body.requestToken)) as {
+      role: "player" | "admin";
+      account_key: string;
+      trust_device: number;
+      expires_at: number;
+      approved_at: number | null;
+      denied_at: number | null;
+      denial_code: string | null;
+      session_token: string | null;
+      trusted_token: string | null;
+    } | undefined;
+    if (!handoff || handoff.expires_at <= now()) {
+      response.status(410).json({ error: "登入要求已過期，請重新寄送確認信。" });
+      return;
+    }
+    if (handoff.denied_at && handoff.denial_code === "PLAYER_SESSION_ACTIVE") {
+      response.status(409).json({
+        code: "PLAYER_SESSION_ACTIVE",
+        error: "此帳號已在其他裝置登入；請先在該裝置登出後再試。",
+      });
+      return;
+    }
+    if (!handoff.approved_at || !handoff.session_token || (handoff.trust_device === 1 && !handoff.trusted_token)) {
+      response.status(202).json({ approved: false });
+      return;
+    }
+    let sessionToken: string;
+    let trustedToken: string | null = null;
+    try {
+      sessionToken = decryptHandoffValue(handoff.session_token, authHandoffEncryptionKey);
+      if (handoff.trusted_token) {
+        trustedToken = decryptHandoffValue(handoff.trusted_token, authHandoffEncryptionKey);
+      }
+    } catch {
+      response.status(410).json({ error: "登入要求已失效，請重新申請。" });
+      return;
+    }
+    if (handoff.role === "admin") {
+      response.append("Set-Cookie", `${ADMIN_SESSION_COOKIE_NAME}=${sessionToken}; Path=/admin; HttpOnly; SameSite=Strict${secureCookies ? "; Secure" : ""}`);
+      if (trustedToken) setAdminTrustedDeviceCookie(response, trustedToken, secureCookies);
+      else clearAdminTrustedDeviceCookie(response, secureCookies);
+      response.json({ approved: true, role: "admin" });
+      return;
+    }
+    setSessionCookie(response, sessionToken, secureCookies);
+    if (trustedToken) setTrustedDeviceCookie(response, trustedToken, secureCookies);
+    else clearTrustedDeviceCookie(response, secureCookies);
+    const player = options.database.prepare(
+      `SELECT id, email, anonymous_code, email_verified_at, nickname, leaderboard_visible
+       FROM players WHERE email = ?`,
+    ).get(handoff.account_key) as PlayerRecord | undefined;
+    if (!player) {
+      response.status(410).json({ error: "玩家帳號不存在，請重新申請登入。" });
+      return;
+    }
+    response.json({ approved: true, role: "player", player: serializePlayer(player) });
   });
 
   app.post("/auth/device-login", (request: Request, response: Response) => {
@@ -1612,6 +1874,21 @@ export function createAuthApp(options: AuthAppOptions): Express {
         options.database.exec("ROLLBACK");
         clearTrustedDeviceCookie(response, secureCookies);
         response.status(401).json({ error: "此裝置的信任已失效，請以 Email 確認。" });
+        return;
+      }
+
+      const activePlayerSession = options.database
+        .prepare(
+          `SELECT device_token_hash FROM player_sessions
+           WHERE player_id = ? AND revoked_at IS NULL`,
+        )
+        .get(player.id) as { device_token_hash: string | null } | undefined;
+      if (activePlayerSession && activePlayerSession.device_token_hash !== tokenHash) {
+        options.database.exec("ROLLBACK");
+        response.status(409).json({
+          code: "PLAYER_SESSION_ACTIVE",
+          error: "此帳號已在其他裝置登入；請先在該裝置登出後再試。",
+        });
         return;
       }
 

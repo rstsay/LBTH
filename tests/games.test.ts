@@ -1,4 +1,5 @@
 import { DatabaseSync } from "node:sqlite";
+import { completeMagicLinkLogin } from "./helpers/auth-flow.js";
 import { createServer, type Server } from "node:http";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { createAuthApp, type MagicLinkSender } from "../src/auth.ts";
@@ -6,6 +7,7 @@ import { createAuthApp, type MagicLinkSender } from "../src/auth.ts";
 interface SentLink {
   email: string;
   token: string;
+  requestId: string;
 }
 
 class TestMagicLinkSender implements MagicLinkSender {
@@ -13,10 +15,11 @@ class TestMagicLinkSender implements MagicLinkSender {
 
   async send(email: string, url: string): Promise<void> {
     const token = new URL(url).searchParams.get("token");
-    if (!token) {
+    const requestId = new URL(url).searchParams.get("requestId");
+    if (!token || !requestId) {
       throw new Error("Expected token in magic link URL");
     }
-    this.sent.push({ email, token });
+    this.sent.push({ email, token, requestId });
   }
 }
 
@@ -105,11 +108,7 @@ describe("遊戲管理與生命週期", () => {
     if (!link) {
       throw new Error("Expected a magic link");
     }
-    const response = await fetch(`${baseUrl}/auth/verify`, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ token: link.token }),
-    });
+    const response = await completeMagicLinkLogin(baseUrl, link.token, requestResponse.headers.get("X-Auth-Request-Token")!, link.requestId);
     expect(response.status).toBe(200);
     const cookie = response.headers.get("set-cookie")?.split(";")[0];
     if (!cookie) {
@@ -280,7 +279,7 @@ describe("遊戲管理與生命週期", () => {
     ).toEqual({ count: 2 });
   });
 
-  it("prevents logging in from another device while playing, then resumes after pausing", async () => {
+  it("keeps the login lock after pausing until the active device logs out", async () => {
     now = Date.UTC(2026, 0, 1, 3);
     const gameId = await createDraft(
       "跨裝置恢復",
@@ -306,11 +305,7 @@ describe("遊戲管理與生命週期", () => {
     if (!link) {
       throw new Error("Expected a magic link");
     }
-    const blockedLogin = await fetch(`${baseUrl}/auth/verify`, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ token: link.token }),
-    });
+    const blockedLogin = await completeMagicLinkLogin(baseUrl, link.token, requestResponse.headers.get("X-Auth-Request-Token")!, link.requestId);
     const firstDeviceStillActive = await fetch(`${baseUrl}/auth/me`, {
       headers: { cookie: firstDeviceCookie },
     });
@@ -321,11 +316,20 @@ describe("遊戲管理與生命週期", () => {
     expect((await playerRequest(firstDeviceCookie, `/games/${gameId}/pause`, "POST")).status).toBe(
       200,
     );
-    const resumedLogin = await fetch(`${baseUrl}/auth/verify`, {
+    expect((await playerRequest(firstDeviceCookie, "/auth/logout", "POST")).status).toBe(204);
+    const replacementRequest = await fetch(`${baseUrl}/auth/magic-links`, {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ token: link.token }),
+      body: JSON.stringify({ email: "player@example.com" }),
     });
+    const replacementLink = mailer.sent.at(-1);
+    if (!replacementLink) throw new Error("Expected a new magic link after logout");
+    const resumedLogin = await completeMagicLinkLogin(
+      baseUrl,
+      replacementLink.token,
+      replacementRequest.headers.get("X-Auth-Request-Token")!,
+      replacementLink.requestId,
+    );
     const secondDeviceCookie = resumedLogin.headers.get("set-cookie")?.split(";")[0];
     if (!secondDeviceCookie) {
       throw new Error("Expected a resumed session cookie");
@@ -342,6 +346,128 @@ describe("遊戲管理與生命週期", () => {
       gameId,
       status: "playing",
       progress: { collectedTreasureIds: ["treasure-2"] },
+    });
+    expect(
+      (
+        await fetch(`${baseUrl}/auth/me`, {
+          headers: { cookie: firstDeviceCookie },
+        })
+      ).status,
+    ).toBe(401);
+  });
+
+  it("心跳逾時會保留回合進度，但仍須登出才能跨裝置登入", async () => {
+    now = Date.UTC(2026, 0, 1, 3);
+    const gameId = await createDraft(
+      "回合心跳驗證",
+      "2026-01-01T10:00:00+08:00",
+      "2026-01-01T12:00:00+08:00",
+    );
+    await publishGame(gameId);
+    const firstDeviceCookie = await login();
+    expect((await playerRequest(firstDeviceCookie, `/games/${gameId}/join`, "POST")).status).toBe(
+      200,
+    );
+    database
+      .prepare("UPDATE game_participants SET progress_json = ? WHERE game_id = ?")
+      .run('{"collectedTreasureIds":["treasure-heartbeat"]}', gameId);
+
+    now += 90_000;
+    const heartbeat = await playerRequest(
+      firstDeviceCookie,
+      `/games/${gameId}/heartbeat`,
+      "POST",
+    );
+    expect(heartbeat.status).toBe(200);
+
+    now += 119_999;
+    const requestResponse = await fetch(`${baseUrl}/auth/magic-links`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ email: "player@example.com" }),
+    });
+    expect(requestResponse.status).toBe(202);
+    const link = mailer.sent.at(-1);
+    if (!link) {
+      throw new Error("Expected a magic link");
+    }
+    const earlyLogin = await completeMagicLinkLogin(baseUrl, link.token, requestResponse.headers.get("X-Auth-Request-Token")!, link.requestId);
+    expect(earlyLogin.status).toBe(409);
+    expect(
+      (
+        await fetch(`${baseUrl}/auth/me`, {
+          headers: { cookie: firstDeviceCookie },
+        })
+      ).status,
+    ).toBe(200);
+
+    now += 1;
+    const staleRequest = await fetch(`${baseUrl}/auth/magic-links`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ email: "player@example.com" }),
+    });
+    const staleLink = mailer.sent.at(-1);
+    if (!staleLink) throw new Error("Expected a magic link after the heartbeat timeout");
+    const staleLogin = await completeMagicLinkLogin(
+      baseUrl,
+      staleLink.token,
+      staleRequest.headers.get("X-Auth-Request-Token")!,
+      staleLink.requestId,
+    );
+    expect(staleLogin.status).toBe(409);
+    const stillActive = await fetch(`${baseUrl}/auth/me`, {
+      headers: { cookie: firstDeviceCookie },
+    });
+    expect(stillActive.status).toBe(200);
+    expect((await playerRequest(firstDeviceCookie, "/auth/logout", "POST")).status).toBe(204);
+    const replacementRequest = await fetch(`${baseUrl}/auth/magic-links`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ email: "player@example.com" }),
+    });
+    const replacementLink = mailer.sent.at(-1);
+    if (!replacementLink) throw new Error("Expected a new magic link after logout");
+    const resumedLogin = await completeMagicLinkLogin(
+      baseUrl,
+      replacementLink.token,
+      replacementRequest.headers.get("X-Auth-Request-Token")!,
+      replacementLink.requestId,
+    );
+    const secondDeviceCookie = resumedLogin.headers.get("set-cookie")?.split(";")[0];
+    if (!secondDeviceCookie) {
+      throw new Error("Expected a resumed session cookie");
+    }
+    const participant = database
+      .prepare(
+        "SELECT status, progress_json, device_token_hash FROM game_participants WHERE game_id = ?",
+      )
+      .get(gameId) as {
+      status: string;
+      progress_json: string;
+      device_token_hash: string | null;
+    };
+    const game = database
+      .prepare("SELECT status FROM games WHERE id = ?")
+      .get(gameId) as { status: string };
+    const resumedGame = await playerRequest(
+      secondDeviceCookie,
+      `/games/${gameId}/join`,
+      "POST",
+    );
+
+    expect(resumedLogin.status).toBe(200);
+    expect(participant).toMatchObject({
+      status: "paused",
+      progress_json: '{"collectedTreasureIds":["treasure-heartbeat"]}',
+      device_token_hash: null,
+    });
+    expect(game.status).toBe("published");
+    expect(resumedGame.status).toBe(200);
+    expect(await resumedGame.json()).toMatchObject({
+      gameId,
+      status: "playing",
+      progress: { collectedTreasureIds: ["treasure-heartbeat"] },
     });
     expect(
       (

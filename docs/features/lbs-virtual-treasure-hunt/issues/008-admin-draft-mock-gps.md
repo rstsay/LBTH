@@ -8,6 +8,8 @@
 
 ## 8. [#8](https://github.com/rstsay/LBTH/issues/8) 管理員草稿 Mock GPS 測試
 
+**Status:** 已實作；聚焦測試 18 項通過
+
 **User Story**  
 身為管理員，我希望能在發布前測試位置搜集邏輯，但不污染正式玩家成績。
 
@@ -31,7 +33,15 @@ Labels: HITL, admin, testing, security, P0
 
 ## 驗收
 
-- [ ] 完成上方驗收條件；相關 API、權限與錯誤情境符合產品需求文件。
+- [x] 完成上方驗收條件；相關 API、權限與錯誤情境符合產品需求文件。
 
 **原始 GitHub issue：** [#8](https://github.com/rstsay/LBTH/issues/8)
+
+## Implementation log
+
+- Date: 2026-10-26
+- Tests added: 無；驗收既有 Mock GPS API、前端地理計算與管理員權限測試。
+- Key decisions: Mock GPS 僅保留在管理員草稿測試面板；測試只計算判定，不寫入正式玩家搜集資料。
+- Architectural friction found: 無
+- Follow-up work: 無
 

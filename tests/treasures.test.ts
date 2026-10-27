@@ -1,4 +1,5 @@
 import { DatabaseSync } from "node:sqlite";
+import { completeMagicLinkLogin } from "./helpers/auth-flow.js";
 import { createServer, type Server } from "node:http";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { createAuthApp, type MagicLinkSender } from "../src/auth.ts";
@@ -6,6 +7,7 @@ import { COLLECTION_THRESHOLD_METERS } from "../web/geo.js";
 
 class TestMagicLinkSender implements MagicLinkSender {
   readonly tokens: string[] = [];
+  readonly requestIds = new Map<string, string>();
 
   async send(_email: string, url: string): Promise<void> {
     const token = new URL(url).searchParams.get("token");
@@ -13,6 +15,7 @@ class TestMagicLinkSender implements MagicLinkSender {
       throw new Error("Expected token in magic link URL");
     }
     this.tokens.push(token);
+    this.requestIds.set(token, new URL(url).searchParams.get("requestId")!);
   }
 }
 
@@ -381,11 +384,8 @@ describe("寶藏資料模型與草稿管理", () => {
       body: JSON.stringify({ email: "player@example.com" }),
     });
     expect(requestResponse.status).toBe(202);
-    const loginResponse = await fetch(`${baseUrl}/auth/verify`, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ token: mailer.tokens[0] }),
-    });
+    const token = mailer.tokens[0]!;
+    const loginResponse = await completeMagicLinkLogin(baseUrl, token, requestResponse.headers.get("X-Auth-Request-Token")!, mailer.requestIds.get(token)!);
     const cookie = loginResponse.headers.get("set-cookie")?.split(";")[0];
     if (!cookie) {
       throw new Error("Expected a session cookie");

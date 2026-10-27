@@ -1,6 +1,6 @@
 ﻿**Feature:** 遊戲管理與寶藏設定  
 **PRD version:** v2.2  
-**Status:** 程式端已實作；驗收待執行（本次僅靜態檢視，未執行測試）  
+**Status:** 遊戲生命週期聚焦測試 10 項通過；管理員與玩家介面操作待驗收<br>
 **Source requirement:** 遊戲管理與生命週期 — 4.1 遊戲建立與發布、13.2 遊戲與多場活動  
 **Iteration:** 1  
 **Type:** HITL  
@@ -42,4 +42,10 @@ Labels: HITL, admin, games, lifecycle, P0
 - [ ] 完成上方驗收條件；相關 API、權限與錯誤情境符合產品需求文件。
 
 **原始 GitHub issue：** [#3](https://github.com/rstsay/LBTH/issues/3)
+
+## 實作紀錄
+
+- 日期：2026-10-26
+- 測試：最近執行 `npm test -- tests/games.test.ts`，10 項測試全數通過；`npm run typecheck` 通過。
+- 驗收：多場建立／發布、時區、玩家切換與進度恢復、遊戲暫停／結束及七天封存已有 API 測試；管理員與玩家介面操作仍待人工驗收。
 

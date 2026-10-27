@@ -141,6 +141,15 @@ input:focus, textarea:focus, select:focus { border-color: #7ea187; box-shadow: 0
 .profile-form > label:first-child, .profile-form > input { grid-column: 1 / -1; }
 .profile-form .button { grid-column: 2; grid-row: 3 / span 2; }
 .check-row { display: flex; min-height: 34px; align-items: center; gap: 8px; color: #536458; font-size: 11px; cursor: pointer; }
+.stack-form .login-trust-row { font-size: 12px; }
+.stack-form .login-trust-row input[type="checkbox"] {
+  width: 14px;
+  min-width: 14px;
+  height: 14px;
+  min-height: 14px;
+  padding: 0;
+  flex: 0 0 14px;
+}
 .check-row input { accent-color: var(--green); }
 
 .hunt-heading { align-items: center; margin-bottom: 16px; }
@@ -280,6 +289,8 @@ input:focus, textarea:focus, select:focus { border-color: #7ea187; box-shadow: 0
 .text-link { color: #356743; font-size: 11px; }
 .verification-page { display: grid; min-height: 100vh; place-items: center; padding: 20px; }
 .verification-page .auth-card { width: min(430px, 100%); text-align: center; }
+.verification-page .auth-card { border: 0; background: transparent; box-shadow: none; padding: 20px; }
+.verification-page .auth-card > :not([data-verification-status]):not([data-verification]):not(.form-error) { display: none; }
 .brand-logo { display: block; width: 145px; max-width: 70%; height: auto; margin: 0 auto 24px; }
 .verification-page h1 { margin: 0; color: #26382f; font-size: 26px; }
 .verification-page .muted { margin: 10px 0 18px; }

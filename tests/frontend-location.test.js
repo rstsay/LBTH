@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { ForegroundLocationTracker } from "../web/location.js";
+import { ForegroundLocationTracker, toApiLocation } from "../web/location.js";
 
 class MockGeolocation {
   watches = new Map();
@@ -42,6 +42,20 @@ const position = (latitude, timestamp = 10_000) => ({
 });
 
 describe("正式前端前景定位追蹤", () => {
+  it("preserves browser GPS timestamps as numeric milliseconds for the API", () => {
+    expect(toApiLocation({
+      latitude: 25,
+      longitude: 121,
+      accuracy: 5,
+      timestamp: 1_798_704_000_000,
+    })).toEqual({
+      latitude: 25,
+      longitude: 121,
+      accuracy: 5,
+      timestamp: 1_798_704_000_000,
+    });
+  });
+
   it("reports each valid fix but rate-limits server reports to once every five seconds", () => {
     const geolocation = new MockGeolocation();
     const visibility = new MockVisibilityTarget();
@@ -113,6 +127,45 @@ describe("正式前端前景定位追蹤", () => {
     visibility.setHidden(false);
     geolocation.report(2, position(25.2));
     expect(onLocation).toHaveBeenCalledTimes(1);
+    expect(onLocationReport).toHaveBeenCalledTimes(1);
+    tracker.stop();
+  });
+
+  it("ignores a queued callback from the previous watch after returning to the foreground", () => {
+    const geolocation = new MockGeolocation();
+    const visibility = new MockVisibilityTarget();
+    const onLocation = vi.fn();
+    const onLocationReport = vi.fn();
+    const onError = vi.fn();
+    const tracker = new ForegroundLocationTracker({
+      geolocation,
+      visibility,
+      onLocation,
+      onLocationReport,
+      onPaused: vi.fn(),
+      onError,
+      now: () => 10_000,
+    });
+
+    tracker.start();
+    const staleCallback = geolocation.watches.get(1);
+    const staleErrorCallback = geolocation.errors.get(1);
+    visibility.setHidden(true);
+    visibility.setHidden(false);
+
+    staleCallback?.(position(25.1));
+    staleErrorCallback?.({ code: 1, message: "stale watch error" });
+
+    expect(onLocation).not.toHaveBeenCalled();
+    expect(onLocationReport).not.toHaveBeenCalled();
+    expect(onError).not.toHaveBeenCalled();
+    geolocation.report(2, position(25.2));
+    expect(onLocation).toHaveBeenCalledWith({
+      latitude: 25.2,
+      longitude: 121,
+      accuracy: 5,
+      timestamp: 10_000,
+    });
     expect(onLocationReport).toHaveBeenCalledTimes(1);
     tracker.stop();
   });

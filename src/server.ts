@@ -72,6 +72,7 @@ const app = createAuthApp({
   googleMapsApiKey: process.env.GOOGLE_MAPS_API_KEY?.trim() ?? "",
   adminBootstrapEmail: requiredEnvironmentVariable("ADMIN_BOOTSTRAP_EMAIL"),
   adminTotpEncryptionKey: process.env.ADMIN_TOTP_ENCRYPTION_KEY?.trim(),
+  authHandoffEncryptionKey: process.env.AUTH_HANDOFF_ENCRYPTION_KEY?.trim(),
   trustProxyHops: nonNegativeIntegerEnvironmentVariable(
     "TRUST_PROXY_HOPS",
     0,

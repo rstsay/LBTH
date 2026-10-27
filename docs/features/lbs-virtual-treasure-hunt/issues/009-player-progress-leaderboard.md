@@ -8,6 +8,8 @@
 
 ## 9. [#9](https://github.com/rstsay/LBTH/issues/9) 全站累計前三名與玩家進度
 
+**Status:** 已實作；聚焦測試 25 項通過
+
 **User Story**  
 身為玩家，我希望查看目前遊戲進度及跨遊戲累計排行榜。
 
@@ -36,7 +38,15 @@ Labels: AFK, leaderboard, progress, frontend, backend, P0
 
 ## 驗收
 
-- [ ] 完成上方驗收條件；相關 API、權限與錯誤情境符合產品需求文件。
+- [x] 完成上方驗收條件；相關 API、權限與錯誤情境符合產品需求文件。
 
 **原始 GitHub issue：** [#9](https://github.com/rstsay/LBTH/issues/9)
+
+## Implementation log
+
+- Date: 2026-10-26
+- Tests added: 無；驗收既有排行榜、進度、重置／還原、遊戲刪除及帳號刪除測試。
+- Key decisions: 排行榜、玩家累計及完成場數由伺服器搜集事件與啟用寶藏計算；保留排序規則及個人總數與公開榜單隱藏設定的分離。
+- Architectural friction found: 無
+- Follow-up work: 無；依賴 issue #6、#7 已完成
 

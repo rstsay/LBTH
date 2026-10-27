@@ -8,26 +8,26 @@
 
 ### 玩家身份與會話
 
-- [#1 Email Magic Link 與玩家身份](./docs/features/lbs-virtual-treasure-hunt/issues/001-email-magic-link-player-identity.md)
-- [#2 單一有效會話與跨裝置恢復](./docs/features/lbs-virtual-treasure-hunt/issues/002-single-session-cross-device-restore.md)（程式端已實作；驗收待執行）
+- [#1 Email Magic Link 與玩家身份](./docs/features/lbs-virtual-treasure-hunt/issues/001-email-magic-link-player-identity.md)（本次登入聚焦測試 27 項通過；實際收信與瀏覽器流程待驗收）
+- [#2 單一有效會話與跨裝置恢復](./docs/features/lbs-virtual-treasure-hunt/issues/002-single-session-cross-device-restore.md)（登出前阻擋其他裝置登入已實作；完整測試通過，背景心跳與實機驗收待完成）
 
 ### 遊戲管理與寶藏設定
 
-- [#3 多遊戲管理與生命週期](./docs/features/lbs-virtual-treasure-hunt/issues/003-multi-game-lifecycle.md)（程式端已實作；驗收待執行）
+- [#3 多遊戲管理與生命週期](./docs/features/lbs-virtual-treasure-hunt/issues/003-multi-game-lifecycle.md)（聚焦測試 10 項通過；管理員與玩家介面操作待驗收）
 - [#4 寶藏資料模型與草稿地圖編輯](./docs/features/lbs-virtual-treasure-hunt/issues/004-treasure-draft-map-management.md)（程式端已實作；驗收待執行）
 - [#5 JSON 匯入、驗證與預覽](./docs/features/lbs-virtual-treasure-hunt/issues/005-treasure-json-import.md)（程式端已實作；驗收待執行）
 
 ### 玩家尋寶與進度
 
-- [#6 前景定位與固定 20 公尺搜集驗證](./docs/features/lbs-virtual-treasure-hunt/issues/006-foreground-location-20m-collection.md)
-- [#7 冪等搜集與伺服器權威進度](./docs/features/lbs-virtual-treasure-hunt/issues/007-idempotent-server-authoritative-collection.md)
-- [#9 全站累計前三名與玩家進度](./docs/features/lbs-virtual-treasure-hunt/issues/009-player-progress-leaderboard.md)
+- [#6 前景定位與固定 20 公尺搜集驗證](./docs/features/lbs-virtual-treasure-hunt/issues/006-foreground-location-20m-collection.md)（已實作；聚焦測試 34 項通過）
+- [#7 冪等搜集與伺服器權威進度](./docs/features/lbs-virtual-treasure-hunt/issues/007-idempotent-server-authoritative-collection.md)（已實作；聚焦測試 26 項通過）
+- [#9 全站累計前三名與玩家進度](./docs/features/lbs-virtual-treasure-hunt/issues/009-player-progress-leaderboard.md)（已實作；聚焦測試 25 項通過）
 
 ### 管理員安全與覆核
 
-- [#8 管理員草稿 Mock GPS 測試](./docs/features/lbs-virtual-treasure-hunt/issues/008-admin-draft-mock-gps.md)
-- [#10 異常訊號與雙人審查](./docs/features/lbs-virtual-treasure-hunt/issues/010-anomaly-review-two-admins.md)
-- [#11 管理員登入、角色與審計](./docs/features/lbs-virtual-treasure-hunt/issues/011-admin-totp-roles-audit.md)（已改為裝置信任登入；暫停 TOTP；驗收待執行）
+- [#8 管理員草稿 Mock GPS 測試](./docs/features/lbs-virtual-treasure-hunt/issues/008-admin-draft-mock-gps.md)（已實作；聚焦測試 18 項通過）
+- [#10 異常訊號與雙人審查](./docs/features/lbs-virtual-treasure-hunt/issues/010-anomaly-review-two-admins.md)（程式端已實作；聚焦測試 7 項通過；整體驗收待完成）
+- [#11 管理員登入、角色與審計](./docs/features/lbs-virtual-treasure-hunt/issues/011-admin-totp-roles-audit.md)（本次登入聚焦測試 27 項通過；正式郵件與瀏覽器流程待驗收）
 
 ### 隱私與營運可靠性
 

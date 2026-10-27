@@ -15,6 +15,7 @@ interface SentLink {
 
 class FakeMagicLinkSender implements MagicLinkSender {
   readonly sent: SentLink[] = [];
+  readonly requestTokens = new Map<string, string>();
   fail = false;
 
   async send(email: string, url: string): Promise<void> {
@@ -65,18 +66,31 @@ describe("玩家 Email Magic Link 驗證", () => {
   });
 
   async function requestMagicLink(email: string): Promise<Response> {
-    return fetch(`${baseUrl}/auth/magic-links`, {
+    const response = await fetch(`${baseUrl}/auth/magic-links`, {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ email }),
     });
+    const link = mailer.sent.at(-1);
+    const requestToken = response.headers.get("X-Auth-Request-Token");
+    if (link && requestToken) mailer.requestTokens.set(link.token, requestToken);
+    return response;
   }
 
   async function verify(token: string): Promise<Response> {
-    return fetch(`${baseUrl}/auth/verify`, {
+    const requestToken = mailer.requestTokens.get(token);
+    const requestId = new URL(mailer.sent.find((link) => link.token === token)!.url)
+      .searchParams.get("requestId");
+    const approval = await fetch(`${baseUrl}/auth/verify`, {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ token }),
+      body: JSON.stringify({ token, requestId }),
+    });
+    if (!approval.ok) return approval;
+    return fetch(`${baseUrl}/auth/complete`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ requestToken }),
     });
   }
 
@@ -95,11 +109,16 @@ describe("玩家 Email Magic Link 驗證", () => {
 
   it("serves the frontend and exposes only the configured public Maps key", async () => {
     const appResponse = await fetch(`${baseUrl}/app`);
+    const appScriptResponse = await fetch(`${baseUrl}/app/app.js`);
+    const handoffScriptResponse = await fetch(`${baseUrl}/app/auth-handoff.js`);
     const configResponse = await fetch(`${baseUrl}/app/config.js`);
     const configBody = await configResponse.text();
 
     expect(appResponse.status).toBe(200);
     expect(await appResponse.text()).toContain("LBS 虛擬尋寶");
+    expect(appScriptResponse.headers.get("cache-control")).toBe("no-store");
+    expect(handoffScriptResponse.status).toBe(200);
+    expect(handoffScriptResponse.headers.get("cache-control")).toBe("no-store");
     expect(configResponse.status).toBe(200);
     expect(configResponse.headers.get("cache-control")).toBe("no-store");
     expect(configBody).toContain('googleMapsApiKey: ""');
@@ -149,6 +168,74 @@ describe("玩家 Email Magic Link 驗證", () => {
     expect(response.headers.get("set-cookie")).toContain("SameSite=Lax");
   });
 
+  it("uses email confirmation only to approve login on the requesting device", async () => {
+    const requestResponse = await requestMagicLink("handoff@example.com");
+    const requestBody = await requestResponse.json();
+    const link = mailer.sent[0];
+    if (!link) throw new Error("Expected a magic link");
+    const requestToken = requestResponse.headers.get("X-Auth-Request-Token");
+    const requestId = new URL(link.url).searchParams.get("requestId");
+    if (!requestId) throw new Error("Expected a request identifier in the email link");
+    expect(new URL(link.url).searchParams.has("requestToken")).toBe(false);
+    expect(link.url).not.toContain(requestToken);
+    const confirmationUrl = new URL(`${baseUrl}/auth/verify`);
+    confirmationUrl.searchParams.set("token", link.token);
+    confirmationUrl.searchParams.set("requestId", requestId);
+    const confirmationPage = await fetch(confirmationUrl);
+    expect(confirmationPage.status).toBe(200);
+    expect(await confirmationPage.text()).toContain('data-verification="player" hidden');
+    const waiting = await fetch(`${baseUrl}/auth/complete`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ requestToken }),
+    });
+
+    const approval = await fetch(`${baseUrl}/auth/verify`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ token: link.token, requestId }),
+    });
+    const loginOnRequestingDevice = await fetch(`${baseUrl}/auth/complete`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ requestToken }),
+    });
+
+    expect(requestResponse.status).toBe(202);
+    expect(requestToken).toEqual(expect.any(String));
+    expect(requestBody.requestToken).toBe(requestToken);
+    expect(waiting.status).toBe(202);
+    expect(waiting.headers.get("set-cookie")).toBeNull();
+    expect(approval.status).toBe(200);
+    expect(approval.headers.get("set-cookie")).toBeNull();
+    expect(loginOnRequestingDevice.status).toBe(200);
+    expect(loginOnRequestingDevice.headers.get("set-cookie")).toContain("player_session=");
+  });
+
+  it("expires an unconfirmed login request after three minutes", async () => {
+    const requestResponse = await requestMagicLink("expired-handoff@example.com");
+    const requestToken = requestResponse.headers.get("X-Auth-Request-Token");
+    const link = mailer.sent.at(-1);
+    if (!link) throw new Error("Expected a magic link");
+    const requestId = new URL(link.url).searchParams.get("requestId");
+
+    now += 3 * 60 * 1000;
+    const approval = await fetch(`${baseUrl}/auth/verify`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ token: link.token, requestId }),
+    });
+    const completion = await fetch(`${baseUrl}/auth/complete`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ requestToken }),
+    });
+
+    expect(approval.status).toBe(410);
+    expect(completion.status).toBe(410);
+    expect(completion.headers.get("set-cookie")).toBeNull();
+  });
+
   it("authenticates the verified player using an HttpOnly session cookie", async () => {
     await requestMagicLink("player@example.com");
     const sent = mailer.sent[0];
@@ -170,7 +257,7 @@ describe("玩家 Email Magic Link 驗證", () => {
     expect(result.player.email).toBe("player@example.com");
   });
 
-  it("revokes the previous device session after a successful login", async () => {
+  it("blocks a second device until the active session explicitly logs out", async () => {
     await requestMagicLink("player@example.com");
     const firstLink = mailer.sent[0];
     if (!firstLink) {
@@ -189,25 +276,39 @@ describe("玩家 Email Magic Link 驗證", () => {
       throw new Error("Expected the second magic link");
     }
     const secondLogin = await verify(secondLink.token);
-    const secondCookie = secondLogin.headers.get("set-cookie")?.split(";")[0];
-    if (!secondCookie) {
-      throw new Error("Expected the second session cookie");
-    }
-
     const firstDeviceResponse = await fetch(`${baseUrl}/auth/me`, {
       headers: { cookie: firstCookie },
     });
-    const secondDeviceResponse = await fetch(`${baseUrl}/auth/me`, {
+    expect(secondLogin.status).toBe(409);
+    expect(firstDeviceResponse.status).toBe(200);
+    expect(
+      database
+        .prepare("SELECT COUNT(*) AS count FROM player_sessions WHERE revoked_at IS NULL")
+        .get(),
+    ).toEqual({ count: 1 });
+
+    const logoutResponse = await fetch(`${baseUrl}/auth/logout`, {
+      method: "POST",
+      headers: { cookie: firstCookie },
+    });
+    expect(logoutResponse.status).toBe(204);
+    await requestMagicLink("player@example.com");
+    const thirdLink = mailer.sent[2];
+    if (!thirdLink) throw new Error("Expected a new magic link after logout");
+    const thirdLogin = await verify(thirdLink.token);
+    const secondCookie = thirdLogin.headers.get("set-cookie")?.split(";")[0];
+    if (!secondCookie) throw new Error("Expected a new session after logout");
+    const oldDeviceResponse = await fetch(`${baseUrl}/auth/me`, {
+      headers: { cookie: firstCookie },
+    });
+    const newDeviceResponse = await fetch(`${baseUrl}/auth/me`, {
       headers: { cookie: secondCookie },
     });
 
-    expect(firstDeviceResponse.status).toBe(401);
-    expect(secondDeviceResponse.status).toBe(200);
-    expect(await secondDeviceResponse.json()).toMatchObject({
-      player: {
-        id: firstResult.player.id,
-        email: "player@example.com",
-      },
+    expect(oldDeviceResponse.status).toBe(401);
+    expect(newDeviceResponse.status).toBe(200);
+    expect(await newDeviceResponse.json()).toMatchObject({
+      player: { id: firstResult.player.id, email: "player@example.com" },
     });
     expect(
       database
@@ -216,7 +317,7 @@ describe("玩家 Email Magic Link 驗證", () => {
     ).toEqual({ count: 1 });
   });
 
-  it("keeps the current session valid until another Magic Link is successfully verified", async () => {
+  it("keeps the current session valid when a new-device Magic Link is denied", async () => {
     await requestMagicLink("player@example.com");
     const link = mailer.sent[0];
     if (!link) {
@@ -229,21 +330,20 @@ describe("玩家 Email Magic Link 驗證", () => {
     }
 
     await requestMagicLink("player@example.com");
-    const expiredLink = mailer.sent[1];
-    if (!expiredLink) {
+    const secondLink = mailer.sent[1];
+    if (!secondLink) {
       throw new Error("Expected a second magic link");
     }
-    now += 15 * 60 * 1000;
-    const expiredLoginResponse = await verify(expiredLink.token);
+    const secondLogin = await verify(secondLink.token);
     const currentSessionResponse = await fetch(`${baseUrl}/auth/me`, {
       headers: { cookie },
     });
 
-    expect(expiredLoginResponse.status).toBe(410);
+    expect(secondLogin.status).toBe(409);
     expect(currentSessionResponse.status).toBe(200);
   });
 
-  it("does not revoke another player's active session", async () => {
+  it("preserves both players' sessions when a replacement login is denied", async () => {
     await requestMagicLink("first@example.com");
     const firstLink = mailer.sent[0];
     if (!firstLink) {
@@ -271,7 +371,7 @@ describe("玩家 Email Magic Link 驗證", () => {
     if (!replacementLink) {
       throw new Error("Expected a replacement magic link");
     }
-    await verify(replacementLink.token);
+    const replacementLogin = await verify(replacementLink.token);
 
     const firstPlayerResponse = await fetch(`${baseUrl}/auth/me`, {
       headers: { cookie: firstCookie },
@@ -280,7 +380,8 @@ describe("玩家 Email Magic Link 驗證", () => {
       headers: { cookie: secondCookie },
     });
 
-    expect(firstPlayerResponse.status).toBe(401);
+    expect(replacementLogin.status).toBe(409);
+    expect(firstPlayerResponse.status).toBe(200);
     expect(secondPlayerResponse.status).toBe(200);
     expect((await secondPlayerResponse.json()).player.email).toBe("second@example.com");
   });
@@ -350,6 +451,12 @@ describe("玩家 Email Magic Link 驗證", () => {
     }
     const firstResponse = await verify(firstLink.token);
     const firstResult = await firstResponse.json();
+    const firstCookie = firstResponse.headers.get("set-cookie")?.split(";")[0];
+    if (!firstCookie) throw new Error("Expected the first session cookie");
+    expect((await fetch(`${baseUrl}/auth/logout`, {
+      method: "POST",
+      headers: { cookie: firstCookie },
+    })).status).toBe(204);
 
     await requestMagicLink("player@example.COM");
     const secondLink = mailer.sent[1];

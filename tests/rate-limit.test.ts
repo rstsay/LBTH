@@ -1,10 +1,12 @@
 import { DatabaseSync } from "node:sqlite";
+import { completeMagicLinkLogin } from "./helpers/auth-flow.js";
 import { createServer, type Server } from "node:http";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { createAuthApp, type MagicLinkSender } from "../src/auth.ts";
 
 class TestMagicLinkSender implements MagicLinkSender {
   readonly tokens: string[] = [];
+  readonly requestIds = new Map<string, string>();
 
   async send(_email: string, url: string): Promise<void> {
     const token = new URL(url).searchParams.get("token");
@@ -12,6 +14,7 @@ class TestMagicLinkSender implements MagicLinkSender {
       throw new Error("Expected token in magic link URL");
     }
     this.tokens.push(token);
+    this.requestIds.set(token, new URL(url).searchParams.get("requestId")!);
   }
 }
 
@@ -68,16 +71,13 @@ describe("伺服器端 API 限流", () => {
   }
 
   async function createPlayer(email: string): Promise<string> {
-    expect((await requestMagicLink(email)).status).toBe(202);
+    const requestResponse = await requestMagicLink(email);
+    expect(requestResponse.status).toBe(202);
     const token = mailer.tokens.at(-1);
     if (!token) {
       throw new Error("Expected a player Magic Link");
     }
-    const response = await fetch(`${baseUrl}/auth/verify`, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ token }),
-    });
+    const response = await completeMagicLinkLogin(baseUrl, token, requestResponse.headers.get("X-Auth-Request-Token")!, mailer.requestIds.get(token)!);
     expect(response.status).toBe(200);
     const cookie = response.headers.get("set-cookie")?.split(";")[0];
     if (!cookie) {

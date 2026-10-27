@@ -4,6 +4,7 @@
 - Do not begin implementation until the requirements have been confirmed with the user.
 - Follow all applicable skills when their workflow matches the task.
 - 程式碼註解、介面文案、文件及對話回應使用繁體中文。
+- for implementation phase, security related concerns always require my approval, otherwise just go ahead
 
 # LBS 虛擬尋寶 PWA 專案指引
 

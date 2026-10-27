@@ -1,4 +1,5 @@
 import { DatabaseSync } from "node:sqlite";
+import { completeMagicLinkLogin } from "./helpers/auth-flow.js";
 import { createServer, type Server } from "node:http";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { createAuthApp, type MagicLinkSender } from "../src/auth.ts";
@@ -6,6 +7,7 @@ import { COLLECTION_THRESHOLD_METERS } from "../web/geo.js";
 
 class TestMagicLinkSender implements MagicLinkSender {
   readonly tokens: string[] = [];
+  readonly requestIds = new Map<string, string>();
 
   async send(_email: string, url: string): Promise<void> {
     const token = new URL(url).searchParams.get("token");
@@ -13,6 +15,7 @@ class TestMagicLinkSender implements MagicLinkSender {
       throw new Error("Expected token in magic link URL");
     }
     this.tokens.push(token);
+    this.requestIds.set(token, new URL(url).searchParams.get("requestId")!);
   }
 }
 
@@ -116,11 +119,8 @@ describe("玩家位置與伺服器搜集驗證", () => {
       body: JSON.stringify({ email: "gps-player@example.com" }),
     });
     expect(linkResponse.status).toBe(202);
-    const verifyResponse = await fetch(`${baseUrl}/auth/verify`, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ token: mailer.tokens[mailer.tokens.length - 1] }),
-    });
+    const token = mailer.tokens[mailer.tokens.length - 1]!;
+    const verifyResponse = await completeMagicLinkLogin(baseUrl, token, linkResponse.headers.get("X-Auth-Request-Token")!, mailer.requestIds.get(token)!);
     expect(verifyResponse.status).toBe(200);
     const cookie = verifyResponse.headers.get("set-cookie")?.split(";")[0];
     if (!cookie) {
@@ -229,21 +229,19 @@ describe("玩家位置與伺服器搜集驗證", () => {
         })
       ).status,
     ).toBe(200);
+    expect((await fetch(`${baseUrl}/auth/logout`, {
+      method: "POST",
+      headers: { cookie },
+    })).status).toBe(204);
 
-    expect(
-      (
-        await fetch(`${baseUrl}/auth/magic-links`, {
+    const reloginRequest = await fetch(`${baseUrl}/auth/magic-links`, {
           method: "POST",
           headers: { "content-type": "application/json" },
           body: JSON.stringify({ email: "gps-player@example.com" }),
-        })
-      ).status,
-    ).toBe(202);
-    const reloginResponse = await fetch(`${baseUrl}/auth/verify`, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ token: mailer.tokens[mailer.tokens.length - 1] }),
-    });
+        });
+    expect(reloginRequest.status).toBe(202);
+    const reloginToken = mailer.tokens[mailer.tokens.length - 1]!;
+    const reloginResponse = await completeMagicLinkLogin(baseUrl, reloginToken, reloginRequest.headers.get("X-Auth-Request-Token")!, mailer.requestIds.get(reloginToken)!);
     const retryCookie = reloginResponse.headers.get("set-cookie")?.split(";")[0];
     if (reloginResponse.status !== 200 || !retryCookie) {
       throw new Error("Expected a replacement player session");
@@ -335,6 +333,10 @@ describe("玩家位置與伺服器搜集驗證", () => {
         })
       ).status,
     ).toBe(200);
+    expect((await fetch(`${baseUrl}/auth/logout`, {
+      method: "POST",
+      headers: { cookie: firstGame.cookie },
+    })).status).toBe(204);
 
     const secondGame = await createActiveGame();
     const secondCollection = await collect(
