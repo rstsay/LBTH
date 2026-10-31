@@ -47,6 +47,22 @@ function nonNegativeIntegerEnvironmentVariable(
   return value;
 }
 
+function isLocalOnlyHostname(hostname: string): boolean {
+  const normalized = hostname.toLowerCase().replace(/^\[|\]$/g, "");
+  if (normalized === "localhost" || normalized.endsWith(".localhost") || normalized === "::1") {
+    return true;
+  }
+  const octets = normalized.split(".").map(Number);
+  if (octets.length !== 4 || octets.some((octet) => !Number.isInteger(octet) || octet < 0 || octet > 255)) {
+    return false;
+  }
+  const [first, second] = octets;
+  return first === 10 || first === 127 ||
+    (first === 192 && second === 168) ||
+    (first === 172 && second >= 16 && second <= 31) ||
+    (first === 169 && second === 254);
+}
+
 const databasePath = resolve(process.env.DATABASE_PATH ?? "./data/lbth.sqlite");
 mkdirSync(dirname(databasePath), { recursive: true });
 const database = new DatabaseSync(databasePath);
@@ -65,10 +81,14 @@ const mailer = new SmtpMagicLinkSender(requiredEnvironmentVariable("SMTP_FROM"),
   secure: process.env.SMTP_SECURE === "true",
   ...(smtpUser && smtpPassword ? { user: smtpUser, password: smtpPassword } : {}),
 });
+const publicAppUrl = requiredEnvironmentVariable("PUBLIC_APP_URL");
+if (process.env.NODE_ENV !== "production" && isLocalOnlyHostname(new URL(publicAppUrl).hostname)) {
+  console.warn("PUBLIC_APP_URL 使用 localhost 或區域網路位址；外網裝置無法開啟 Email Magic Link，請改用可公開連線的測試網域。");
+}
 const app = createAuthApp({
   database,
   mailer,
-  publicAppUrl: requiredEnvironmentVariable("PUBLIC_APP_URL"),
+  publicAppUrl,
   googleMapsApiKey: process.env.GOOGLE_MAPS_API_KEY?.trim() ?? "",
   adminBootstrapEmail: requiredEnvironmentVariable("ADMIN_BOOTSTRAP_EMAIL"),
   adminTotpEncryptionKey: process.env.ADMIN_TOTP_ENCRYPTION_KEY?.trim(),

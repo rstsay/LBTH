@@ -1,3 +1,8 @@
+---
+name: to-issues
+description: Converts user requests or notes into structured issues.
+---
+
 ## Feature workspace mode
 
 If the user provides `--feature <slug>`, use:

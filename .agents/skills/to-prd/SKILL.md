@@ -1,3 +1,8 @@
+---
+name: to-prd
+description: 
+---
+
 ## Feature workspace mode
 
 If the user provides `--feature <slug>`, use:

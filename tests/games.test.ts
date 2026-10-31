@@ -279,7 +279,7 @@ describe("遊戲管理與生命週期", () => {
     ).toEqual({ count: 2 });
   });
 
-  it("keeps the login lock after pausing until the active device logs out", async () => {
+  it("prevents logging in from another device while playing, then resumes after pausing", async () => {
     now = Date.UTC(2026, 0, 1, 3);
     const gameId = await createDraft(
       "跨裝置恢復",
@@ -316,14 +316,13 @@ describe("遊戲管理與生命週期", () => {
     expect((await playerRequest(firstDeviceCookie, `/games/${gameId}/pause`, "POST")).status).toBe(
       200,
     );
-    expect((await playerRequest(firstDeviceCookie, "/auth/logout", "POST")).status).toBe(204);
     const replacementRequest = await fetch(`${baseUrl}/auth/magic-links`, {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ email: "player@example.com" }),
     });
     const replacementLink = mailer.sent.at(-1);
-    if (!replacementLink) throw new Error("Expected a new magic link after logout");
+    if (!replacementLink) throw new Error("Expected a new magic link after pausing");
     const resumedLogin = await completeMagicLinkLogin(
       baseUrl,
       replacementLink.token,
@@ -356,7 +355,7 @@ describe("遊戲管理與生命週期", () => {
     ).toBe(401);
   });
 
-  it("心跳逾時會保留回合進度，但仍須登出才能跨裝置登入", async () => {
+  it("心跳逾時會保留回合進度，並允許新裝置登入接續回合", async () => {
     now = Date.UTC(2026, 0, 1, 3);
     const gameId = await createDraft(
       "回合心跳驗證",
@@ -415,26 +414,8 @@ describe("遊戲管理與生命週期", () => {
       staleRequest.headers.get("X-Auth-Request-Token")!,
       staleLink.requestId,
     );
-    expect(staleLogin.status).toBe(409);
-    const stillActive = await fetch(`${baseUrl}/auth/me`, {
-      headers: { cookie: firstDeviceCookie },
-    });
-    expect(stillActive.status).toBe(200);
-    expect((await playerRequest(firstDeviceCookie, "/auth/logout", "POST")).status).toBe(204);
-    const replacementRequest = await fetch(`${baseUrl}/auth/magic-links`, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ email: "player@example.com" }),
-    });
-    const replacementLink = mailer.sent.at(-1);
-    if (!replacementLink) throw new Error("Expected a new magic link after logout");
-    const resumedLogin = await completeMagicLinkLogin(
-      baseUrl,
-      replacementLink.token,
-      replacementRequest.headers.get("X-Auth-Request-Token")!,
-      replacementLink.requestId,
-    );
-    const secondDeviceCookie = resumedLogin.headers.get("set-cookie")?.split(";")[0];
+    expect(staleLogin.status).toBe(200);
+    const secondDeviceCookie = staleLogin.headers.get("set-cookie")?.split(";")[0];
     if (!secondDeviceCookie) {
       throw new Error("Expected a resumed session cookie");
     }
@@ -456,7 +437,6 @@ describe("遊戲管理與生命週期", () => {
       "POST",
     );
 
-    expect(resumedLogin.status).toBe(200);
     expect(participant).toMatchObject({
       status: "paused",
       progress_json: '{"collectedTreasureIds":["treasure-heartbeat"]}',

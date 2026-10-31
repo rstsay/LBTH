@@ -6,12 +6,14 @@
 
 - [ ] 伺服器及 `npm run db:restore` 使用專案根目錄 `.env`（或部署平台注入的同名環境變數）；`.env.example` 僅供複製建立設定，不是執行時設定檔。
 - [ ] `.env` 不提交至 Git；正式環境 `NODE_ENV=production` 且 `PUBLIC_APP_URL` 使用 HTTPS。
+- [ ] 跨裝置驗收時，`PUBLIC_APP_URL` 與使用者開啟的外部正式／測試網域一致；不得使用 `localhost` 或只在區域網路可達的 IP 作為 Email Magic Link 網址。
 - [ ] 正式環境設定至少 32 位元組的 `AUTH_HANDOFF_ENCRYPTION_KEY`；多個服務實例使用相同值，且不寫入部署紀錄。
 - [ ] `DATABASE_PATH` 指向持久化磁碟；`BACKUP_DIRECTORY` 指向持久化且受限存取的目錄，並確認備份有異地副本及可用的還原程序。
 - [ ] 若服務位於反向代理後，確認代理會覆寫 `X-Forwarded-For`，再將 `TRUST_PROXY_HOPS` 設為實際可信代理 hop 數；否則維持 `0`。
 - [ ] 記錄部署環境變數的來源與更新程序，不在紀錄中保存其值。
 - [x] SMTP 連線與認證檢查通過；未傳送測試郵件。
 - [ ] 實際寄送玩家 Magic Link，確認收信、登入及地圖載入。
+- [ ] 從另一台裝置使用正式／測試網域登入，並確認 Email Magic Link 開啟的網址可由該裝置連線。
 
 ## Google Maps API 金鑰與用量
 

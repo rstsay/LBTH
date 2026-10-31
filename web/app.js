@@ -12,6 +12,7 @@ const state = {
   loginRole: "player",
   player: null,
   games: [],
+  gameSummary: { completedGames: 0, totalGames: 0 },
   game: null,
   progress: null,
   leaderboard: [],
@@ -184,7 +185,7 @@ function gameStatusLabel(status) {
 }
 
 function playerGameIsAvailable(game) {
-  return game.status === "active";
+  return game.status === "active" && !game.completed;
 }
 
 function setBusy(button, busy, label) {
@@ -214,30 +215,8 @@ function setLoginRole(role) {
   }
   $("#magic-link-submit").textContent = role === "admin" ? "管理員登入" : "登入";
   $("#magic-link-submit").dataset.originalLabel = $("#magic-link-submit").textContent;
-  $("#trusted-device-login").textContent = role === "admin"
-    ? "以信任的管理員裝置登入"
-    : "使用已信任裝置登入";
-  $("#trusted-device-login").hidden = role !== "admin";
   $("#auth-message").textContent = "";
   showLoginError();
-}
-
-async function continueWithTrustedDevice() {
-  const button = $("#trusted-device-login");
-  setBusy(button, true, "正在登入…");
-  try {
-    if (state.loginRole === "admin") {
-      await api("/admin/auth/device-login", { method: "POST" });
-      await loadAdminWorkspace();
-    } else {
-      await api("/auth/device-login", { method: "POST" });
-      await loadPlayerHome();
-    }
-  } catch (error) {
-    showLoginError(error.message);
-  } finally {
-    setBusy(button, false);
-  }
 }
 
 async function submitMagicLink(event) {
@@ -292,7 +271,7 @@ async function submitMagicLink(event) {
     if (error.code === "AUTH_HANDOFF_EXPIRED") {
       showLoginError();
       $("#auth-message").textContent = "已逾時，請確認 Email 地址是否正確。";
-    } else if (error.code === "PLAYER_SESSION_ACTIVE") {
+    } else if (error.code === "PLAYER_SESSION_ACTIVE" || error.code === "PLAYER_GAME_SESSION_ACTIVE") {
       showLoginError(error.message);
     } else {
       showLoginError(error.message);
@@ -304,23 +283,39 @@ async function submitMagicLink(event) {
 
 async function loadPlayerHome() {
   const { player } = await api("/auth/me");
-  const [{ games }, { leaderboard }] = await Promise.all([
+  const [gameCatalog, { leaderboard }] = await Promise.all([
     api("/games"),
     api("/leaderboard"),
   ]);
+  const { games } = gameCatalog;
   state.role = "player";
   state.player = player;
   state.games = games;
+  state.gameSummary = {
+    completedGames: gameCatalog.completedGames,
+    totalGames: gameCatalog.totalGames,
+  };
   state.leaderboard = leaderboard;
   $("#account-label").textContent = player.nickname || player.anonymousCode;
   setText("#history-total", player.totalCollectedSoFar);
   $("#nickname").value = player.nickname || "";
   $("#leaderboard-visible").checked = player.leaderboardVisible;
   setText("#available-games", games.filter(playerGameIsAvailable).length);
+  setText("#completed-games", `${state.gameSummary.completedGames} / ${state.gameSummary.totalGames}`);
   renderGameCards();
   renderLeaderboard();
+  const savedGameId = localStorage.getItem("lbs_current_game");
+  const completedCurrentGame = games.find(
+    (game) => game.id === savedGameId && game.completed && game.status === "active",
+  );
+  if (completedCurrentGame && localStorage.getItem("lbs_current_game_status") === "playing") {
+    await api(`/games/${encodeURIComponent(completedCurrentGame.id)}/pause`, {
+      method: "POST",
+    });
+    localStorage.setItem("lbs_current_game_status", "paused");
+  }
   const currentGame = games.find(
-    (game) => game.id === player.currentGameId && game.status === "active",
+    (game) => game.id === player.currentGameId && game.status === "active" && !game.completed,
   );
   if (currentGame) {
     await api(`/games/${encodeURIComponent(currentGame.id)}/join`, {
@@ -356,9 +351,13 @@ function renderGameCards() {
     card.append(date);
     const foot = makeElement("div", "game-card-foot");
     foot.append(makeElement("span", "muted", `${game.totalTreasuresCount} 個目標`));
-    const join = makeElement("button", "button button-primary", game.status === "active" ? "開始探索" : "尚未開放");
+    const join = makeElement(
+      "button",
+      "button button-primary",
+      game.completed ? "已完成" : game.status === "active" ? "開始探索" : "尚未開放",
+    );
     join.type = "button";
-    join.disabled = !playerGameIsAvailable(game);
+    join.disabled = game.completed || !playerGameIsAvailable(game);
     join.addEventListener("click", () => joinGame(game, join));
     foot.append(join);
     card.append(foot);
@@ -386,19 +385,25 @@ function renderLeaderboard() {
 async function loadProfileAndGames() {
   $("#player-error").textContent = "";
   try {
-    const [{ player }, { games }, { leaderboard }] = await Promise.all([
+    const [{ player }, gameCatalog, { leaderboard }] = await Promise.all([
       api("/auth/me"),
       api("/games"),
       api("/leaderboard"),
     ]);
+    const { games } = gameCatalog;
     state.player = player;
     state.games = games;
+    state.gameSummary = {
+      completedGames: gameCatalog.completedGames,
+      totalGames: gameCatalog.totalGames,
+    };
     state.leaderboard = leaderboard;
     $("#account-label").textContent = player.nickname || player.anonymousCode;
     setText("#history-total", player.totalCollectedSoFar);
     $("#nickname").value = player.nickname || "";
     $("#leaderboard-visible").checked = player.leaderboardVisible;
     setText("#available-games", games.filter(playerGameIsAvailable).length);
+    setText("#completed-games", `${state.gameSummary.completedGames} / ${state.gameSummary.totalGames}`);
     renderGameCards();
     renderLeaderboard();
   } catch (error) {
@@ -1594,7 +1599,10 @@ async function ensureAdminMap() {
   $("#admin-map-message").textContent = "";
   try {
     await ensureMapsLoaded();
-    const center = state.adminGame.mapCenter;
+    const lastAddedTreasure = state.adminTreasures.at(-1);
+    const center = lastAddedTreasure
+      ? { latitude: lastAddedTreasure.latitude, longitude: lastAddedTreasure.longitude }
+      : state.adminGame.mapCenter;
     if (!state.adminMap) {
       state.adminMap = new google.maps.Map($("#admin-map"), {
         center: { lat: center.latitude, lng: center.longitude },
@@ -2027,7 +2035,6 @@ async function logout() {
   state.adminAccess = null;
   showPage("auth");
   setLoginRole("player");
-  $("#trusted-device-login").hidden = !wasPlayer;
   $("#auth-message").textContent = "已登出；此裝置仍受信任。選擇身分後可直接繼續登入。";
 }
 
@@ -2054,7 +2061,6 @@ async function forgetTrustedDevice() {
     state.role = "";
     state.game = null;
     state.player = null;
-    $("#trusted-device-login").hidden = true;
     localStorage.removeItem("lbs_current_game");
     localStorage.removeItem("lbs_current_game_status");
     showPage("auth");
@@ -2071,7 +2077,6 @@ function bindEvents() {
   $("#player-login-tab").addEventListener("click", () => setLoginRole("player"));
   $("#admin-login-tab").addEventListener("click", () => setLoginRole("admin"));
   $("#magic-link-form").addEventListener("submit", submitMagicLink);
-  $("#trusted-device-login").addEventListener("click", continueWithTrustedDevice);
   $("#logout-button").addEventListener("click", logout);
   $("#profile-toggle").addEventListener("click", () => {
     $("#profile-panel").hidden = !$("#profile-panel").hidden;

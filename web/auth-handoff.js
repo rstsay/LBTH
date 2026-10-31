@@ -32,7 +32,7 @@ export async function waitForAuthHandoff({
         return result;
       }
     } catch (error) {
-      if (error?.code === "PLAYER_SESSION_ACTIVE") {
+      if (error?.code === "PLAYER_SESSION_ACTIVE" || error?.code === "PLAYER_GAME_SESSION_ACTIVE") {
         throw error;
       }
       if (error?.status === 410 || error?.code === "AUTH_HANDOFF_EXPIRED") {

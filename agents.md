@@ -6,6 +6,12 @@
 - 程式碼註解、介面文案、文件及對話回應使用繁體中文。
 - for implementation phase, security related concerns always require my approval, otherwise just go ahead
 
+## Code & Content Editing Rules
+
+- **Minimal Output Rule (Save Tokens):** 
+  When modifying code or text, DO NOT rewrite or reproduce the entire file or large untouched sections. 
+  Only output the specific modified functions, lines, or paragraphs, clearly indicating where the changes belong.
+  
 # LBS 虛擬尋寶 PWA 專案指引
 
 ## 規格優先順序

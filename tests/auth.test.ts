@@ -257,15 +257,15 @@ describe("玩家 Email Magic Link 驗證", () => {
     expect(result.player.email).toBe("player@example.com");
   });
 
-  it("blocks a second device until the active session explicitly logs out", async () => {
+  it("revokes previous player session when a new Magic Link is verified", async () => {
     await requestMagicLink("player@example.com");
     const firstLink = mailer.sent[0];
     if (!firstLink) {
       throw new Error("Expected the first magic link");
     }
-    const firstLogin = await verify(firstLink.token);
-    const firstCookie = firstLogin.headers.get("set-cookie")?.split(";")[0];
-    const firstResult = await firstLogin.json();
+    const firstResponse = await verify(firstLink.token);
+    const firstResult = await firstResponse.json();
+    const firstCookie = firstResponse.headers.get("set-cookie")?.split(";")[0];
     if (!firstCookie) {
       throw new Error("Expected the first session cookie");
     }
@@ -276,39 +276,25 @@ describe("玩家 Email Magic Link 驗證", () => {
       throw new Error("Expected the second magic link");
     }
     const secondLogin = await verify(secondLink.token);
+    const secondCookie = secondLogin.headers.get("set-cookie")?.split(";")[0];
+    if (!secondCookie) {
+      throw new Error("Expected the second session cookie");
+    }
+
     const firstDeviceResponse = await fetch(`${baseUrl}/auth/me`, {
       headers: { cookie: firstCookie },
     });
-    expect(secondLogin.status).toBe(409);
-    expect(firstDeviceResponse.status).toBe(200);
-    expect(
-      database
-        .prepare("SELECT COUNT(*) AS count FROM player_sessions WHERE revoked_at IS NULL")
-        .get(),
-    ).toEqual({ count: 1 });
-
-    const logoutResponse = await fetch(`${baseUrl}/auth/logout`, {
-      method: "POST",
-      headers: { cookie: firstCookie },
-    });
-    expect(logoutResponse.status).toBe(204);
-    await requestMagicLink("player@example.com");
-    const thirdLink = mailer.sent[2];
-    if (!thirdLink) throw new Error("Expected a new magic link after logout");
-    const thirdLogin = await verify(thirdLink.token);
-    const secondCookie = thirdLogin.headers.get("set-cookie")?.split(";")[0];
-    if (!secondCookie) throw new Error("Expected a new session after logout");
-    const oldDeviceResponse = await fetch(`${baseUrl}/auth/me`, {
-      headers: { cookie: firstCookie },
-    });
-    const newDeviceResponse = await fetch(`${baseUrl}/auth/me`, {
+    const secondDeviceResponse = await fetch(`${baseUrl}/auth/me`, {
       headers: { cookie: secondCookie },
     });
 
-    expect(oldDeviceResponse.status).toBe(401);
-    expect(newDeviceResponse.status).toBe(200);
-    expect(await newDeviceResponse.json()).toMatchObject({
-      player: { id: firstResult.player.id, email: "player@example.com" },
+    expect(firstDeviceResponse.status).toBe(401);
+    expect(secondDeviceResponse.status).toBe(200);
+    expect(await secondDeviceResponse.json()).toMatchObject({
+      player: {
+        id: firstResult.player.id,
+        email: "player@example.com",
+      },
     });
     expect(
       database
@@ -317,7 +303,7 @@ describe("玩家 Email Magic Link 驗證", () => {
     ).toEqual({ count: 1 });
   });
 
-  it("keeps the current session valid when a new-device Magic Link is denied", async () => {
+  it("keeps the current session valid until another Magic Link is successfully verified", async () => {
     await requestMagicLink("player@example.com");
     const link = mailer.sent[0];
     if (!link) {
@@ -330,20 +316,21 @@ describe("玩家 Email Magic Link 驗證", () => {
     }
 
     await requestMagicLink("player@example.com");
-    const secondLink = mailer.sent[1];
-    if (!secondLink) {
+    const expiredLink = mailer.sent[1];
+    if (!expiredLink) {
       throw new Error("Expected a second magic link");
     }
-    const secondLogin = await verify(secondLink.token);
+    now += 15 * 60 * 1000;
+    const expiredLoginResponse = await verify(expiredLink.token);
     const currentSessionResponse = await fetch(`${baseUrl}/auth/me`, {
       headers: { cookie },
     });
 
-    expect(secondLogin.status).toBe(409);
+    expect(expiredLoginResponse.status).toBe(410);
     expect(currentSessionResponse.status).toBe(200);
   });
 
-  it("preserves both players' sessions when a replacement login is denied", async () => {
+  it("does not revoke another player's active session", async () => {
     await requestMagicLink("first@example.com");
     const firstLink = mailer.sent[0];
     if (!firstLink) {
@@ -371,7 +358,7 @@ describe("玩家 Email Magic Link 驗證", () => {
     if (!replacementLink) {
       throw new Error("Expected a replacement magic link");
     }
-    const replacementLogin = await verify(replacementLink.token);
+    await verify(replacementLink.token);
 
     const firstPlayerResponse = await fetch(`${baseUrl}/auth/me`, {
       headers: { cookie: firstCookie },
@@ -380,8 +367,7 @@ describe("玩家 Email Magic Link 驗證", () => {
       headers: { cookie: secondCookie },
     });
 
-    expect(replacementLogin.status).toBe(409);
-    expect(firstPlayerResponse.status).toBe(200);
+    expect(firstPlayerResponse.status).toBe(401);
     expect(secondPlayerResponse.status).toBe(200);
     expect((await secondPlayerResponse.json()).player.email).toBe("second@example.com");
   });
@@ -451,13 +437,6 @@ describe("玩家 Email Magic Link 驗證", () => {
     }
     const firstResponse = await verify(firstLink.token);
     const firstResult = await firstResponse.json();
-    const firstCookie = firstResponse.headers.get("set-cookie")?.split(";")[0];
-    if (!firstCookie) throw new Error("Expected the first session cookie");
-    expect((await fetch(`${baseUrl}/auth/logout`, {
-      method: "POST",
-      headers: { cookie: firstCookie },
-    })).status).toBe(204);
-
     await requestMagicLink("player@example.COM");
     const secondLink = mailer.sent[1];
     if (!secondLink) {

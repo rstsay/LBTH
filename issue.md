@@ -23,6 +23,9 @@
 - [#7 冪等搜集與伺服器權威進度](./docs/features/lbs-virtual-treasure-hunt/issues/007-idempotent-server-authoritative-collection.md)（已實作；聚焦測試 26 項通過）
 - [#9 全站累計前三名與玩家進度](./docs/features/lbs-virtual-treasure-hunt/issues/009-player-progress-leaderboard.md)（已實作；聚焦測試 25 項通過）
 
+- [#19 跨地點遊戲選擇與完成場次統計](./docs/features/lbs-virtual-treasure-hunt/issues/019-global-game-discovery-completion.md)（程式已實作；測試與驗收待完成）
+- [#20 登入入口、草稿地圖回位與跨裝置網址](./docs/features/lbs-virtual-treasure-hunt/issues/020-login-map-entry-cross-device-url.md)（程式及文件已更新；外網網址設定與跨裝置驗收待完成）
+
 ### 管理員安全與覆核
 
 - [#8 管理員草稿 Mock GPS 測試](./docs/features/lbs-virtual-treasure-hunt/issues/008-admin-draft-mock-gps.md)（已實作；聚焦測試 18 項通過）

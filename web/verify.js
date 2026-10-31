@@ -37,7 +37,7 @@ document.querySelectorAll("[data-verification]").forEach((form) => {
         "<p class=\"muted\" data-verification-status>已確認，請回到登入頁面。</p>";
     } catch (verificationError) {
       if (status) status.textContent = "";
-      if (verificationError.code === "PLAYER_SESSION_ACTIVE") {
+      if (verificationError.code === "PLAYER_SESSION_ACTIVE" || verificationError.code === "PLAYER_GAME_SESSION_ACTIVE") {
         if (error) error.textContent = verificationError.message;
         form.hidden = true;
         return;

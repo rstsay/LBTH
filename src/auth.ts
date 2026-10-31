@@ -1666,23 +1666,6 @@ export function createAuthApp(options: AuthAppOptions): Express {
         .prepare("SELECT id FROM players WHERE email = ?")
         .get(magicLink.email) as { id: string } | undefined;
       if (existingPlayer) {
-        const activeSession = options.database
-          .prepare("SELECT 1 FROM player_sessions WHERE player_id = ? AND revoked_at IS NULL")
-          .get(existingPlayer.id);
-        if (activeSession) {
-          options.database
-            .prepare("UPDATE magic_links SET consumed_at = ? WHERE token_hash = ? AND consumed_at IS NULL")
-            .run(timestamp, tokenHash);
-          options.database
-            .prepare("UPDATE auth_handoffs SET denied_at = ?, denial_code = 'PLAYER_SESSION_ACTIVE' WHERE token_hash = ?")
-            .run(timestamp, handoffHash.token_hash);
-          options.database.exec("COMMIT");
-          response.status(409).json({
-            code: "PLAYER_SESSION_ACTIVE",
-            error: "此帳號已在其他裝置登入；請先在該裝置登出後再試。",
-          });
-          return;
-        }
         const activeGame = options.database
           .prepare(
             `SELECT game_id, device_token_hash,
@@ -1697,7 +1680,13 @@ export function createAuthApp(options: AuthAppOptions): Express {
         if (activeGame) {
           const stale = timestamp - activeGame.last_heartbeat_at >= PLAYER_GAME_HEARTBEAT_TIMEOUT_MS;
           if (!stale) {
-            options.database.exec("ROLLBACK");
+            options.database
+              .prepare("UPDATE magic_links SET consumed_at = ? WHERE token_hash = ? AND consumed_at IS NULL")
+              .run(timestamp, tokenHash);
+            options.database
+              .prepare("UPDATE auth_handoffs SET denied_at = ?, denial_code = 'PLAYER_GAME_SESSION_ACTIVE' WHERE token_hash = ?")
+              .run(timestamp, handoffHash.token_hash);
+            options.database.exec("COMMIT");
             response.status(409).json({
               code: "PLAYER_GAME_SESSION_ACTIVE",
               error: "玩家仍在另一裝置進行遊戲；請先暫停，或等待心跳逾時後再登入。",
@@ -1720,6 +1709,11 @@ export function createAuthApp(options: AuthAppOptions): Express {
               .run(timestamp + 24 * 60 * 60 * 1000, activeGame.game_id, existingPlayer.id);
           }
         }
+        options.database
+          .prepare(
+            "UPDATE player_sessions SET revoked_at = ? WHERE player_id = ? AND revoked_at IS NULL",
+          )
+          .run(timestamp, existingPlayer.id);
       }
 
       const consumed = options.database
@@ -1801,12 +1795,21 @@ export function createAuthApp(options: AuthAppOptions): Express {
       response.status(410).json({ error: "登入要求已過期，請重新寄送確認信。" });
       return;
     }
-    if (handoff.denied_at && handoff.denial_code === "PLAYER_SESSION_ACTIVE") {
-      response.status(409).json({
-        code: "PLAYER_SESSION_ACTIVE",
-        error: "此帳號已在其他裝置登入；請先在該裝置登出後再試。",
-      });
-      return;
+    if (handoff.denied_at) {
+      if (handoff.denial_code === "PLAYER_GAME_SESSION_ACTIVE") {
+        response.status(409).json({
+          code: "PLAYER_GAME_SESSION_ACTIVE",
+          error: "玩家仍在另一裝置進行遊戲；請先暫停，或等待心跳逾時後再登入。",
+        });
+        return;
+      }
+      if (handoff.denial_code === "PLAYER_SESSION_ACTIVE") {
+        response.status(409).json({
+          code: "PLAYER_SESSION_ACTIVE",
+          error: "此帳號已在其他裝置登入；請先在該裝置登出後再試。",
+        });
+        return;
+      }
     }
     if (!handoff.approved_at || !handoff.session_token || (handoff.trust_device === 1 && !handoff.trusted_token)) {
       response.status(202).json({ approved: false });
@@ -1874,21 +1877,6 @@ export function createAuthApp(options: AuthAppOptions): Express {
         options.database.exec("ROLLBACK");
         clearTrustedDeviceCookie(response, secureCookies);
         response.status(401).json({ error: "此裝置的信任已失效，請以 Email 確認。" });
-        return;
-      }
-
-      const activePlayerSession = options.database
-        .prepare(
-          `SELECT device_token_hash FROM player_sessions
-           WHERE player_id = ? AND revoked_at IS NULL`,
-        )
-        .get(player.id) as { device_token_hash: string | null } | undefined;
-      if (activePlayerSession && activePlayerSession.device_token_hash !== tokenHash) {
-        options.database.exec("ROLLBACK");
-        response.status(409).json({
-          code: "PLAYER_SESSION_ACTIVE",
-          error: "此帳號已在其他裝置登入；請先在該裝置登出後再試。",
-        });
         return;
       }
 

@@ -49,7 +49,6 @@
             <label class="check-row login-trust-row"><input id="trust-device-after-login" type="checkbox" checked> 之後信任此裝置繼續</label>
             <button id="magic-link-submit" class="button button-primary button-wide" type="submit">寄送登入連結</button>
           </form>
-          <button id="trusted-device-login" class="button button-primary button-wide" type="button" hidden>使用已信任裝置登入</button>
           <p id="auth-message" class="notice" role="status" aria-live="polite"></p>
           <p id="auth-error" class="form-error" role="alert" aria-live="polite"></p>
           <p class="fine-print">繼續使用即表示你同意以瀏覽器前景定位參與遊戲。</p>
@@ -94,6 +93,7 @@
         <div class="stats-row">
           <article class="stat-card"><span class="stat-icon">✦</span><div><strong id="history-total">0</strong><span>歷史累計搜集</span></div></article>
           <article class="stat-card"><span class="stat-icon">♧</span><div><strong id="available-games">0</strong><span>可參加遊戲</span></div></article>
+          <article class="stat-card"><span class="stat-icon">✓</span><div><strong id="completed-games">0 / 0</strong><span>已完成／遊戲總數</span></div></article>
         </div>
 
         <section class="section-block" aria-labelledby="games-heading">

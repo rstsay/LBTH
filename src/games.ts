@@ -305,6 +305,26 @@ function countEnabledTreasures(database: DatabaseSync, gameId: string): number {
   return row.count;
 }
 
+function hasPlayerCompletedGame(
+  database: DatabaseSync,
+  gameId: string,
+  playerId: string,
+): boolean {
+  const counts = database
+    .prepare(
+      `SELECT
+         (SELECT COUNT(*) FROM treasures WHERE game_id = ? AND enabled = 1) AS target_count,
+         (SELECT COUNT(*) FROM collected_treasures c
+          JOIN treasures t ON t.id = c.treasure_id AND t.game_id = c.game_id
+          WHERE c.game_id = ? AND c.player_id = ? AND t.enabled = 1) AS collected_count`,
+    )
+    .get(gameId, gameId, playerId) as {
+    target_count: number;
+    collected_count: number;
+  };
+  return counts.target_count > 0 && counts.collected_count === counts.target_count;
+}
+
 function refreshAuthoritativeProgress(
   database: DatabaseSync,
   gameId: string,
@@ -2968,14 +2988,31 @@ export function createPlayerGameRouter(options: GameRouterOptions): Router {
   };
 
   router.get("/", (_request: Request, response: Response) => {
+    const playerId = findPlayerId(response);
     const games = options.database
       .prepare("SELECT * FROM games WHERE status != 'draft' ORDER BY starts_at, id")
       .all()
       .map(parseGameRecord);
+    const completedGameIds = new Set(
+      playerId
+        ? games
+            .filter((game) =>
+              hasPlayerCompletedGame(options.database, game.id, playerId),
+            )
+            .map((game) => game.id)
+        : [],
+    );
     response.json({
-      games: games.map((game) =>
-        serializeGame(game, options.now(), countEnabledTreasures(options.database, game.id)),
-      ),
+      completedGames: completedGameIds.size,
+      totalGames: games.length,
+      games: games.map((game) => ({
+        ...serializeGame(
+          game,
+          options.now(),
+          countEnabledTreasures(options.database, game.id),
+        ),
+        completed: completedGameIds.has(game.id),
+      })),
     });
   });
 
@@ -3156,6 +3193,10 @@ export function createPlayerGameRouter(options: GameRouterOptions): Router {
       timestamp >= game.ends_at
     ) {
       respondConflict(response, "此遊戲目前不接受遊玩。");
+      return;
+    }
+    if (hasPlayerCompletedGame(options.database, game.id, playerId)) {
+      respondConflict(response, "你已完成此遊戲，無法再次加入。");
       return;
     }
 
